@@ -34,17 +34,10 @@ Berlaku di VPS provider mana pun: UpCloud, DigitalOcean, Vultr, Hetzner, Linode,
 
 ## Cara Menjalankan
 
-Download/upload `installerptd.sh` ke VPS, lalu jalankan:
+Jalankan `installerptd.sh` ke VPS:
 
 ```bash
-chmod +x installerptd.sh
-sudo ./installerptd.sh
-```
-
-Atau langsung dari GitHub tanpa download manual:
-
-```bash
-sudo bash <(curl -s https://raw.githubusercontent.com/USERNAME/REPO/main/installerptd.sh)
+bash <(curl -s https://raw.githubusercontent.com/Bintz-debug/ofcinstaller-pterodactyl/main/installerptd.sh)
 ```
 
 Saat dijalankan, script akan menampilkan OS yang terdeteksi lalu menu:
