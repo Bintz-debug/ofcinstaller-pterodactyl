@@ -1291,6 +1291,94 @@ un_third_party_repos() {
 ###############################################################################
 # 3) UNINSTALL PANEL
 ###############################################################################
+# Daftar user yang punya hak ke database tertentu (nama harus sudah lolos is_ident)
+db_users_of() {   # db_users_of NAME
+    is_ident "$1" || return 0
+    mysql_root -N -e "SELECT GROUP_CONCAT(DISTINCT User SEPARATOR ', ') FROM mysql.db WHERE REPLACE(Db,'\\\\','')='$1'" 2>/dev/null \
+        | grep -vx 'NULL' || true
+}
+
+# Info ringkas database: jumlah tabel & ukuran (MB)
+db_summary() {   # db_summary NAME
+    is_ident "$1" || return 0
+    mysql_root -N -e "SELECT CONCAT(COUNT(*), ' tabel, ', ROUND(IFNULL(SUM(data_length+index_length),0)/1024/1024,2), ' MB') FROM information_schema.tables WHERE table_schema='$1'" 2>/dev/null
+}
+
+# Tampilkan daftar database yang terpasang di MariaDB lalu minta user memilih
+# (nomor atau ketik nama). Mengisi DBNAME dan DBUSER, dan menampilkan nama database terpilih.
+pick_database() {   # pick_database "default_db" "default_user"
+    local def_db="$1" def_user="$2" dbs=() d i in_ users sel found sum
+    local can_list=0
+    detect_services_for_uninstall
+    if [[ -n "$(mysql_bin 2>/dev/null)" ]]; then
+        systemctl is-active --quiet "${DB_SERVICE:-mariadb}" 2>/dev/null || systemctl start "${DB_SERVICE:-mariadb}" >>"$LOG_FILE" 2>&1 || true
+        if ensure_mysql_access; then
+            can_list=1
+            mapfile -t dbs < <(mysql_root -N -e 'SHOW DATABASES' 2>/dev/null \
+                | grep -Ev '^(information_schema|mysql|performance_schema|sys|test)$')
+        fi
+    fi
+
+    echo ""
+    if [[ -n "$def_db" ]]; then
+        echo -e "${CYAN}Database Panel terdeteksi (dari catatan/.env):${NC} ${GREEN}${def_db}${NC}${def_user:+  (user: ${def_user})}"
+    fi
+
+    if (( ! can_list || ${#dbs[@]} == 0 )); then
+        warn "Daftar database tidak bisa ditampilkan (MariaDB tidak aktif / tidak bisa login / belum ada database)."
+        ask DBNAME "Nama database Panel yang mau dihapus" "${def_db:-panel}" is_ident "Hanya huruf/angka/underscore (maks 32)."
+        ask DBUSER "User database Panel yang mau dihapus" "${def_user:-pterodactyl}" is_ident "Hanya huruf/angka/underscore (maks 32)."
+        echo -e "${YELLOW}Database terpilih: ${GREEN}${DBNAME}${YELLOW} | user: ${GREEN}${DBUSER}${NC}"
+        return 0
+    fi
+
+    echo -e "${CYAN}Database yang terpasang di MariaDB:${NC}"
+    i=1
+    for d in "${dbs[@]}"; do
+        users="$(db_users_of "$d")"
+        sum="$(db_summary "$d")"
+        printf '  %2d) %-26s user: %-16s %s%s\n' "$i" "$d" "${users:--}" "${sum:+[$sum]}" \
+            "$([[ "$d" == "$def_db" ]] && echo '  <- database Panel')"
+        i=$((i+1))
+    done
+    echo ""
+
+    while true; do
+        read -r -p "Pilih nomor atau ketik nama database yang mau dihapus [${def_db:-panel}]: " in_ || die "Input dihentikan."
+        in_="$(trim "$in_")"; [[ -z "$in_" ]] && in_="${def_db:-panel}"
+        if [[ "$in_" =~ ^[0-9]+$ ]] && (( in_ >= 1 && in_ <= ${#dbs[@]} )); then
+            sel="${dbs[$((in_-1))]}"
+        else
+            sel="$in_"; found=0
+            for d in "${dbs[@]}"; do [[ "$d" == "$sel" ]] && found=1; done
+            if (( ! found )); then
+                warn "Database '${sel}' tidak ada di daftar di atas."
+                confirm "Tetap pakai nama itu?" n || continue
+            fi
+        fi
+        is_ident "$sel" || { warn "Nama database hanya boleh huruf/angka/underscore."; continue; }
+        DBNAME="$sel"; break
+    done
+
+    # tampilkan nama database yang dipilih beserta detailnya
+    users="$(db_users_of "$DBNAME")"
+    sum="$(db_summary "$DBNAME")"
+    echo ""
+    echo -e "${GREEN}Database terpilih : ${DBNAME}${NC}"
+    [[ -n "$sum" ]]   && echo -e "${GREEN}Isi               : ${sum}${NC}"
+    [[ -n "$users" ]] && echo -e "${GREEN}User terkait      : ${users}${NC}"
+    echo ""
+
+    # tebak user dari grant database terpilih
+    users="$(mysql_root -N -e "SELECT DISTINCT User FROM mysql.db WHERE REPLACE(Db,'\\\\','')='${DBNAME}'" 2>/dev/null)"
+    if [[ -n "$users" && "$(wc -l <<<"$users")" -eq 1 ]]; then
+        def_user="$users"
+        info "User database terdeteksi: ${def_user}"
+    fi
+    ask DBUSER "User database yang mau dihapus" "${def_user:-pterodactyl}" is_ident "Hanya huruf/angka/underscore (maks 32)."
+    echo -e "${YELLOW}Akan dihapus: database '${GREEN}${DBNAME}${YELLOW}' dan user '${GREEN}${DBUSER}${YELLOW}'.${NC}"
+}
+
 uninstall_panel() {
     step "Uninstall Pterodactyl Panel (bersih total)"
     state_load
@@ -1303,12 +1391,12 @@ uninstall_panel() {
         local u; u="$(env_val APP_URL)"; u="${u#*://}"; u="${u%%/*}"
         FQDN="${u:-}"; DBNAME="$(env_val DB_DATABASE)"; DBUSER="$(env_val DB_USERNAME)"
         ask FQDN "Domain Panel" "${FQDN:-panel.contoh.com}" is_host
-        ask DBNAME "Nama database Panel" "${DBNAME:-panel}" is_ident
-        ask DBUSER "User database Panel" "${DBUSER:-pterodactyl}" is_ident
         if confirm "Hapus juga paket pendukung (PHP, Nginx, MariaDB, Redis, Certbot, Composer)? Pilih y hanya jika VPS ini khusus Panel" n; then
             NOSTATE_REMOVE_PKGS=1
         fi
     fi
+
+    pick_database "$DBNAME" "$DBUSER"
 
     local has_wings=0 has_docker=0 rm_wings=0 rm_docker=0
     [[ -x /usr/local/bin/wings || -d /etc/pterodactyl ]] && has_wings=1
