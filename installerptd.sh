@@ -1,328 +1,619 @@
-#!/bin/bash
+#!/usr/bin/env bash
 ###############################################################################
-# installerptd.sh
-# All-in-one Pterodactyl Installer/Uninstaller - Multi Distro Linux
+# installerptd.sh  (v2.0)
+# All-in-one Pterodactyl Installer / Uninstaller - Multi Distro Linux
 #
-# Mendukung:
-#   - Debian family : Ubuntu, Debian, Linux Mint, Pop!_OS (apt)
-#   - RHEL family   : Rocky Linux, AlmaLinux, CentOS Stream, RHEL, Fedora (dnf)
+# Keluarga distro yang didukung (semua versi yang masih mendapat update):
+#   - Debian family : Ubuntu 20.04+, Debian 11+, Linux Mint, Pop!_OS, Zorin,
+#                     dan turunan Debian/Ubuntu lain (apt)
+#   - RHEL family   : Rocky, AlmaLinux, CentOS Stream, RHEL, Oracle Linux 8+,
+#                     Fedora 38+ (dnf)
 #
 # Menu:
-#   1) Install Panel (resmi, otomatis sampai selesai)
-#   2) Install & Aktifkan Wings (pakai kode Configuration dari Node)
-#   3) Uninstall Panel (bersih, tidak mengganggu paket dasar VPS)
+#   1) Install Panel   (domain, SSL, database, admin - semua otomatis)
+#   2) Install Wings   (Docker + Wings + konfigurasi dari Node)
+#   3) Uninstall Panel (bersih total, hanya paket yang dipasang script ini)
+#   4) Uninstall Wings (Wings + container game + opsional Docker)
 #
 # Jalankan: sudo bash installerptd.sh
+# Log lengkap: /var/log/installerptd.log
 ###############################################################################
 
-set -e
+set -uo pipefail
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+readonly SCRIPT_VERSION="2.0"
+readonly LOG_FILE="/var/log/installerptd.log"
+readonly STATE_FILE="/root/.installerptd-info"
+readonly PANEL_DIR="/var/www/pterodactyl"
+readonly ACME_ROOT="/var/www/_letsencrypt"
 
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}Jalankan script ini sebagai root (sudo).${NC}"
-   exit 1
-fi
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+# Variabel global (diisi saat runtime)
+OS_ID=""; OS_LIKE=""; OS_VERSION="0"; OS_MAJOR="0"; OS_CODENAME=""; OS_PRETTY=""
+DISTRO_FAMILY=""; EL_MAJOR=0
+PHP_VER=""; PHP_BIN=""; PHP_FPM_SERVICE=""; PHP_FPM_SOCK=""
+DB_SERVICE=""; REDIS_SERVICE=""; WEB_USER=""; WEB_GROUP=""
+USE_SSL=0; IGNORE_PHP_PLATFORM=0
+
+###############################################################################
+# UTILITAS DASAR
+###############################################################################
+log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
+info() { echo -e "${CYAN}[i]${NC} $*"; log "INFO: $*"; }
+ok()   { echo -e "${GREEN}[OK]${NC} $*"; log "OK: $*"; }
+warn() { echo -e "${YELLOW}[!]${NC} $*"; log "WARN: $*"; }
+err()  { echo -e "${RED}[X]${NC} $*" >&2; log "ERR: $*"; }
+die()  { err "$*"; echo -e "    Log lengkap: ${LOG_FILE}" >&2; exit 1; }
+step() { echo -e "\n${GREEN}==> $*${NC}"; log "STEP: $*"; }
+
+# run "Deskripsi" perintah args...   -> output ke log, tampil OK / GAGAL
+run() {
+    local desc="$1"; shift
+    printf '  %-58s ' "$desc ..."
+    log "RUN: $desc :: $*"
+    if "$@" >>"$LOG_FILE" 2>&1; then
+        echo -e "${GREEN}OK${NC}"
+        return 0
+    else
+        local rc=$?
+        echo -e "${RED}GAGAL${NC} (kode ${rc})"
+        tail -n 12 "$LOG_FILE" 2>/dev/null | sed 's/^/      | /'
+        return "$rc"
+    fi
+}
+run_or_die() { local d="$1"; run "$@" || die "Langkah gagal: ${d}"; }
+run_soft()   { run "$@" || true; }
+
+trim() {
+    local s="$1"
+    s="${s//$'\r'/}"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# ask VAR "Prompt" "default" [validator] [pesan_error]
+ask() {
+    local __var="$1" __prompt="$2" __def="${3:-}" __validator="${4:-}"
+    local __errmsg="${5:-Input tidak valid, coba lagi.}" __in
+    while true; do
+        if [[ -n "$__def" ]]; then
+            read -r -p "$__prompt [$__def]: " __in || die "Input dihentikan."
+        else
+            read -r -p "$__prompt: " __in || die "Input dihentikan."
+        fi
+        __in="$(trim "$__in")"
+        [[ -z "$__in" ]] && __in="$__def"
+        if [[ -z "$__in" ]]; then warn "Wajib diisi."; continue; fi
+        if [[ -n "$__validator" ]] && ! "$__validator" "$__in"; then
+            warn "$__errmsg"; continue
+        fi
+        printf -v "$__var" '%s' "$__in"
+        return 0
+    done
+}
+
+# ask_secret VAR "Prompt" [validator] [pesan_error]   (minta konfirmasi ulang)
+ask_secret() {
+    local __var="$1" __prompt="$2" __validator="${3:-}" __errmsg="${4:-Input tidak valid.}" a b
+    while true; do
+        read -r -s -p "$__prompt: " a || die "Input dihentikan."; echo
+        a="${a//$'\r'/}"
+        if [[ -z "$a" ]]; then warn "Wajib diisi."; continue; fi
+        if [[ -n "$__validator" ]] && ! "$__validator" "$a"; then warn "$__errmsg"; continue; fi
+        read -r -s -p "Ulangi password: " b || die "Input dihentikan."; echo
+        b="${b//$'\r'/}"
+        if [[ "$a" != "$b" ]]; then warn "Password tidak sama, ulangi."; continue; fi
+        printf -v "$__var" '%s' "$a"
+        return 0
+    done
+}
+
+# confirm "Pertanyaan" [y|n default]
+confirm() {
+    local p="$1" d="${2:-n}" a hint="[y/N]"
+    [[ "$d" == "y" ]] && hint="[Y/n]"
+    while true; do
+        read -r -p "$p $hint: " a || die "Input dihentikan."
+        a="$(trim "$a")"; a="${a,,}"
+        [[ -z "$a" ]] && a="$d"
+        case "$a" in
+            y|yes|ya) return 0 ;;
+            n|no|tidak) return 1 ;;
+        esac
+    done
+}
+
+random_pass() {
+    local p
+    p="$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24)" || true
+    printf '%s' "$p"
+}
+
+###############################################################################
+# VALIDATOR INPUT
+###############################################################################
+is_email() {
+    local re='^[A-Za-z0-9_%+-]+(\.[A-Za-z0-9_%+-]+)*@([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'
+    [[ "$1" =~ $re ]]
+}
+is_fqdn() {
+    local re='^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'
+    [[ "$1" =~ $re ]]
+}
+is_ipv4() {
+    local re='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+    [[ "$1" =~ $re ]]
+}
+is_host()  { is_fqdn "$1" || is_ipv4 "$1"; }
+is_ident() { local re='^[A-Za-z0-9_]{1,32}$'; [[ "$1" =~ $re ]]; }
+is_username() { local re='^[A-Za-z0-9]([A-Za-z0-9_.-]*[A-Za-z0-9])?$'; [[ "$1" =~ $re && ${#1} -ge 3 ]]; }
+is_nonempty() { [[ -n "$(trim "$1")" ]]; }
+is_tz() {
+    local re='^[A-Za-z0-9_+/-]+$'
+    [[ "$1" =~ $re ]] || return 1
+    [[ ! -d /usr/share/zoneinfo ]] && return 0
+    [[ -f "/usr/share/zoneinfo/$1" ]]
+}
+is_db_pass() {
+    case "$1" in
+        *\'*|*\"*|*\\*|*" "*|*\$*|*\`*) return 1 ;;
+    esac
+    [[ ${#1} -ge 8 ]]
+}
+is_admin_pass() { [[ ${#1} -ge 8 && "$1" =~ [A-Z] && "$1" =~ [a-z] && "$1" =~ [0-9] ]]; }
+
+###############################################################################
+# STATE FILE (dipakai uninstall supaya tahu persis apa yang dipasang script)
+###############################################################################
+state_set() {
+    local k="$1" v="$2"
+    touch "$STATE_FILE"; chmod 600 "$STATE_FILE"
+    sed -i "/^${k}=/d" "$STATE_FILE"
+    printf '%s=%q\n' "$k" "$v" >>"$STATE_FILE"
+}
+state_set_once() { grep -q "^$1=" "$STATE_FILE" 2>/dev/null || state_set "$1" "$2"; }
+state_append() {   # state_append KEY item   (daftar dipisah spasi, tanpa duplikat)
+    local k="$1" item="$2" cur=""
+    [[ -f "$STATE_FILE" ]] && cur="$(grep "^${k}=" "$STATE_FILE" | head -1 | sed -E "s/^${k}=//" | tr -d "'\"\\\\")"
+    case " $cur " in *" $item "*) return 0 ;; esac
+    state_set "$k" "$(trim "$cur $item")"
+}
+state_load() {
+    # shellcheck disable=SC1090
+    [[ -f "$STATE_FILE" ]] && . "$STATE_FILE"
+    return 0
+}
+flag_preexisting() {  # flag_preexisting INST_KEY "perintah-cek"  -> 1 jika script yang memasang
+    local key="$1"; shift
+    if "$@" >/dev/null 2>&1; then state_set_once "$key" 0; else state_set_once "$key" 1; fi
+}
 
 ###############################################################################
 # DETEKSI OS
 ###############################################################################
 detect_os() {
-    if [[ ! -f /etc/os-release ]]; then
-        echo -e "${RED}Tidak bisa mendeteksi OS (/etc/os-release tidak ditemukan).${NC}"
-        exit 1
-    fi
-
+    [[ -f /etc/os-release ]] || die "Tidak bisa mendeteksi OS (/etc/os-release tidak ada)."
     # shellcheck disable=SC1091
-    source /etc/os-release
-    OS_ID="${ID,,}"
-    OS_ID_LIKE="${ID_LIKE,,}"
-    OS_PRETTY="${PRETTY_NAME}"
-    OS_VERSION="${VERSION_ID}"
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"; OS_ID="${OS_ID,,}"
+    OS_LIKE="${ID_LIKE:-}"; OS_LIKE="${OS_LIKE,,}"
+    OS_VERSION="${VERSION_ID:-0}"
+    OS_MAJOR="${OS_VERSION%%.*}"
+    OS_CODENAME="${VERSION_CODENAME:-}"
+    OS_PRETTY="${PRETTY_NAME:-$OS_ID $OS_VERSION}"
+    UBUNTU_CODENAME="${UBUNTU_CODENAME:-}"
+    DEBIAN_CODENAME="${DEBIAN_CODENAME:-}"
 
     case "$OS_ID" in
-        ubuntu|debian|linuxmint|pop)
-            DISTRO_FAMILY="debian"
-            ;;
-        rocky|almalinux|centos|rhel|fedora)
-            DISTRO_FAMILY="rhel"
-            ;;
+        amzn|alpine|arch|manjaro|opensuse*|sles|gentoo|void|nixos)
+            DISTRO_FAMILY="unsupported" ;;
+        ubuntu|debian|linuxmint|pop|raspbian|zorin|elementary|neon|kali|ubuntu-core)
+            DISTRO_FAMILY="debian" ;;
+        rhel|centos|rocky|almalinux|ol|fedora|eurolinux|scientific)
+            DISTRO_FAMILY="rhel" ;;
         *)
-            if [[ "$OS_ID_LIKE" == *debian* ]]; then
-                DISTRO_FAMILY="debian"
-            elif [[ "$OS_ID_LIKE" == *rhel* || "$OS_ID_LIKE" == *fedora* ]]; then
-                DISTRO_FAMILY="rhel"
-            else
-                DISTRO_FAMILY="unsupported"
-            fi
-            ;;
+            if   [[ "$OS_LIKE" == *debian* || "$OS_LIKE" == *ubuntu* ]]; then DISTRO_FAMILY="debian"
+            elif [[ "$OS_LIKE" == *rhel* || "$OS_LIKE" == *fedora* || "$OS_LIKE" == *centos* ]]; then DISTRO_FAMILY="rhel"
+            else DISTRO_FAMILY="unsupported"; fi ;;
     esac
 
     if [[ "$DISTRO_FAMILY" == "unsupported" ]]; then
-        echo -e "${RED}OS '${OS_PRETTY}' belum didukung otomatis oleh script ini.${NC}"
-        echo "Yang didukung: Ubuntu, Debian, Linux Mint, Pop!_OS, Rocky Linux, AlmaLinux, CentOS Stream, RHEL, Fedora."
+        err "OS '${OS_PRETTY}' belum didukung."
+        echo "Didukung: keluarga Debian/Ubuntu (apt) dan keluarga RHEL/Fedora (dnf)."
         exit 1
     fi
+    [[ -d /run/systemd/system ]] || die "Sistem ini tidak memakai systemd (container/WSL?). Pterodactyl butuh systemd."
 
-    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-        PHP_FPM_SOCK="/run/php/php8.3-fpm.sock"
-        PHP_FPM_SERVICE="php8.3-fpm"
-        REDIS_SERVICE="redis-server"
-    else
-        PHP_FPM_SOCK="/run/php-fpm/www.sock"
-        PHP_FPM_SERVICE="php-fpm"
-        REDIS_SERVICE="redis"
-    fi
-
-    echo -e "${CYAN}Terdeteksi OS: ${OS_PRETTY} (keluarga: ${DISTRO_FAMILY})${NC}"
-}
-
-###############################################################################
-# INSTALL DEPENDENCY SESUAI DISTRO
-###############################################################################
-install_dependencies_debian() {
-    echo -e "${GREEN}Update sistem & dependency dasar (apt)...${NC}"
-    apt update -y && apt upgrade -y
-    apt install -y curl wget sudo gnupg2 software-properties-common apt-transport-https ca-certificates lsb-release unzip git
-
-    echo -e "${GREEN}Install PHP, MariaDB, Nginx, Redis, Composer...${NC}"
-
-    # Tentukan apakah perlu pakai PHP native (bukan PPA Ondrej).
-    # PPA Ondrej biasanya baru menyediakan paket beberapa saat setelah
-    # rilis Ubuntu baru, jadi untuk Ubuntu >= 26.04 kita pakai PHP bawaan repo resmi.
-    USE_NATIVE_PHP=0
-    if [[ "$OS_ID" == "ubuntu" ]]; then
-        OLDEST=$(printf '%s\n%s\n' "$OS_VERSION" "26.04" | sort -V | head -n1)
-        if [[ "$OLDEST" != "26.04" || "$OS_VERSION" == "26.04" ]]; then
-            USE_NATIVE_PHP=1
-        fi
-    fi
-
-    if [[ "$USE_NATIVE_PHP" -eq 1 ]]; then
-        echo -e "${YELLOW}Terdeteksi Ubuntu ${OS_VERSION}. PPA Ondrej kemungkinan belum tersedia untuk versi ini,${NC}"
-        echo -e "${YELLOW}jadi PHP akan diinstall langsung dari repo resmi Ubuntu (native), bukan PPA.${NC}"
-
-        apt install -y php php-cli php-gd php-mysql php-mbstring php-bcmath php-xml \
-            php-fpm php-curl php-zip php-intl php-sqlite3
-
-        # Deteksi versi PHP yang benar-benar terpasang, supaya nama service & socket tepat
-        PHP_VER_DETECTED=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)
-        if [[ -n "$PHP_VER_DETECTED" ]]; then
-            PHP_FPM_SOCK="/run/php/php${PHP_VER_DETECTED}-fpm.sock"
-            PHP_FPM_SERVICE="php${PHP_VER_DETECTED}-fpm"
-            echo -e "${CYAN}PHP terdeteksi versi ${PHP_VER_DETECTED} -> service: ${PHP_FPM_SERVICE}, socket: ${PHP_FPM_SOCK}${NC}"
-        fi
-    else
-        LC_ALL=C.UTF-8 add-apt-repository ppa:ondrej/php -y
-        apt update -y
-        apt install -y php8.3 php8.3-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl,sqlite3}
-    fi
-
-    apt install -y mariadb-server nginx tar redis-server certbot
-
-    if ! command -v composer &> /dev/null; then
-        curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-    fi
-
-    systemctl enable --now mariadb "$REDIS_SERVICE" nginx "$PHP_FPM_SERVICE"
-}
-
-install_dependencies_rhel() {
-    echo -e "${GREEN}Update sistem & dependency dasar (dnf)...${NC}"
-    dnf update -y
-    dnf install -y curl wget sudo gnupg2 ca-certificates tar unzip git policycoreutils-python-utils
-
-    echo -e "${GREEN}Install PHP 8.3, MariaDB, Nginx, Redis, Composer...${NC}"
-
-    if [[ "$OS_ID" == "fedora" ]]; then
-        dnf install -y php php-cli php-gd php-mysqlnd php-mbstring php-bcmath php-xml \
-            php-fpm php-curl php-zip php-intl php-pdo
-    else
-        RHEL_VER=$(rpm -E %rhel)
-        dnf install -y "https://rpms.remirepo.net/enterprise/remi-release-${RHEL_VER}.rpm" epel-release
-        dnf module reset php -y
-        dnf module enable php:remi-8.3 -y
-        dnf install -y php php-cli php-gd php-mysqlnd php-mbstring php-bcmath php-xml \
-            php-fpm php-curl php-zip php-intl php-pdo
-    fi
-
-    dnf install -y mariadb-server nginx redis certbot
-
-    if ! command -v composer &> /dev/null; then
-        curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
-    fi
-
-    systemctl enable --now mariadb "$REDIS_SERVICE" nginx "$PHP_FPM_SERVICE"
-
-    echo -e "${YELLOW}Catatan: jika SELinux aktif dan Nginx/PHP-FPM error permission,${NC}"
-    echo -e "${YELLOW}jalankan: setsebool -P httpd_can_network_connect 1${NC}"
-}
-
-###############################################################################
-# 1) INSTALL PANEL
-###############################################################################
-install_panel() {
-    echo -e "${GREEN}=== Install Pterodactyl Panel ===${NC}"
-    echo ""
-
-    read -p "Domain Panel (sudah diarahkan ke IP VPS ini, contoh: panel.contoh.com): " FQDN
-    read -p "Email untuk sertifikat SSL & akun admin: " EMAIL
-    read -p "Nama database (default: panel): " DBNAME
-    DBNAME=${DBNAME:-panel}
-    read -p "Nama user database (default: pterodactyl): " DBUSER
-    DBUSER=${DBUSER:-pterodactyl}
-    read -s -p "Password database: " DBPASS
-    echo ""
-    read -p "Zona waktu (contoh: Asia/Jakarta): " TZONE
-    TZONE=${TZONE:-Asia/Jakarta}
-    echo ""
-    read -p "Domain sudah di-A record ke IP VPS ini? (y/n): " DNS_OK
-
-    if [[ "$DNS_OK" != "y" ]]; then
-        echo -e "${RED}Arahkan domain ke IP VPS dulu sebelum lanjut. Dibatalkan.${NC}"
-        return
-    fi
-
-    echo -e "${YELLOW}Ringkasan: domain=${FQDN}, db=${DBNAME}, dbuser=${DBUSER}, timezone=${TZONE}${NC}"
-    sleep 2
-
-    echo -e "${GREEN}[1/6] Install dependency (${DISTRO_FAMILY})...${NC}"
-    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-        install_dependencies_debian
-    else
-        install_dependencies_rhel
-    fi
-
-    echo -e "${GREEN}[2/6] Setup database...${NC}"
-    mysql -u root <<MYSQL_SCRIPT
-CREATE USER IF NOT EXISTS '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${DBPASS}';
-CREATE DATABASE IF NOT EXISTS ${DBNAME};
-GRANT ALL PRIVILEGES ON ${DBNAME}.* TO '${DBUSER}'@'127.0.0.1' WITH GRANT OPTION;
-FLUSH PRIVILEGES;
-MYSQL_SCRIPT
-
-    echo -e "${GREEN}[3/6] Download file Panel...${NC}"
-    mkdir -p /var/www/pterodactyl
-    cd /var/www/pterodactyl
-    curl -Lo panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-    tar -xzvf panel.tar.gz
-    chmod -R 755 storage/* bootstrap/cache/
-    cp .env.example .env
-    composer install --no-dev --optimize-autoloader --no-interaction
-
-    echo -e "${GREEN}[4/6] Konfigurasi environment Panel...${NC}"
-    php artisan key:generate --force
-
-    php artisan p:environment:setup \
-        --author="${EMAIL}" \
-        --url="https://${FQDN}" \
-        --timezone="${TZONE}" \
-        --cache="redis" \
-        --session="redis" \
-        --queue="redis" \
-        --redis-host="localhost" \
-        --redis-pass="null" \
-        --redis-port="6379" \
-        --settings-ui=true
-
-    php artisan p:environment:database \
-        --host="127.0.0.1" \
-        --port="3306" \
-        --database="${DBNAME}" \
-        --username="${DBUSER}" \
-        --password="${DBPASS}"
-
-    php artisan migrate --seed --force
-
-    echo -e "${GREEN}Buat akun admin Panel. Isi data berikut:${NC}"
-    php artisan p:user:make
-
-    chown -R www-data:www-data /var/www/pterodactyl/* 2>/dev/null || chown -R nginx:nginx /var/www/pterodactyl/*
-
-    echo -e "${GREEN}Setup cron job & queue worker...${NC}"
-    ( crontab -l 2>/dev/null | grep -v 'pterodactyl/artisan schedule:run' ; echo "* * * * * php /var/www/pterodactyl/artisan schedule:run >> /dev/null 2>&1" ) | crontab -
-
-    cat > /etc/systemd/system/pteroq.service <<EOF
-[Unit]
-Description=Pterodactyl Queue Worker
-After=redis.target
-
-[Service]
-User=www-data
-Group=www-data
-Restart=always
-ExecStart=/usr/bin/php /var/www/pterodactyl/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
-StartLimitInterval=180
-StartLimitBurst=30
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    # Sesuaikan user service untuk RHEL family (biasanya nginx, bukan www-data)
     if [[ "$DISTRO_FAMILY" == "rhel" ]]; then
-        sed -i 's/User=www-data/User=nginx/' /etc/systemd/system/pteroq.service
-        sed -i 's/Group=www-data/Group=nginx/' /etc/systemd/system/pteroq.service
+        command -v dnf >/dev/null 2>&1 || die "dnf tidak ditemukan (RHEL/CentOS 7 sudah EOL & tidak didukung)."
+        [[ "$OS_ID" == "fedora" ]] && EL_MAJOR=0 || EL_MAJOR="$OS_MAJOR"
+        WEB_USER="nginx"; WEB_GROUP="nginx"
+    else
+        command -v apt-get >/dev/null 2>&1 || die "apt-get tidak ditemukan."
+        WEB_USER="www-data"; WEB_GROUP="www-data"
     fi
 
-    systemctl daemon-reload
-    systemctl enable --now pteroq.service
-
-    echo -e "${GREEN}[5/6] Request sertifikat SSL untuk ${FQDN}...${NC}"
-    systemctl stop nginx
-    certbot certonly --standalone --non-interactive --agree-tos -m "${EMAIL}" -d "${FQDN}"
-
-    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-    cat > /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh <<'EOF'
-#!/bin/bash
-systemctl reload nginx
-systemctl restart wings 2>/dev/null || true
-EOF
-    chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh
-
-    echo -e "${GREEN}[6/6] Konfigurasi Nginx...${NC}"
-
-    NGINX_TEMPLATE=$(cat <<EOF
-server {
-    listen 80;
-    server_name ${FQDN};
-    return 301 https://\$server_name\$request_uri;
+    check_min_version
 }
 
-server {
-    listen 443 ssl http2;
-    server_name ${FQDN};
+is_ubuntu_like() { [[ "$OS_ID" == "ubuntu" || "$OS_LIKE" == *ubuntu* ]]; }
 
-    root /var/www/pterodactyl/public;
-    index index.php;
+check_min_version() {
+    local too_old=0
+    case "$OS_ID" in
+        ubuntu) [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] && (( OS_MAJOR < 20 )) && too_old=1 ;;
+        debian) [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] && (( OS_MAJOR > 0 && OS_MAJOR < 11 )) && too_old=1 ;;
+        fedora) [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] && (( OS_MAJOR < 38 )) && too_old=1 ;;
+        rhel|centos|rocky|almalinux|ol|eurolinux) [[ "$OS_MAJOR" =~ ^[0-9]+$ ]] && (( OS_MAJOR < 8 )) && too_old=1 ;;
+    esac
+    if (( too_old )); then
+        warn "${OS_PRETTY} sudah EOL / terlalu lama; paket PHP 8.2+ mungkin tidak tersedia."
+        confirm "Tetap lanjut dengan risiko sendiri?" n || exit 1
+    fi
+}
 
-    access_log /var/log/nginx/pterodactyl.app-access.log;
-    error_log  /var/log/nginx/pterodactyl.app-error.log error;
+###############################################################################
+# ABSTRAKSI PAKET
+###############################################################################
+apt_get() {
+    DEBIAN_FRONTEND=noninteractive apt-get -y -o DPkg::Lock::Timeout=300 \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
+}
+pkg_update()  { if [[ "$DISTRO_FAMILY" == "debian" ]]; then apt_get update; else dnf -y makecache; fi; }
+pkg_install() { if [[ "$DISTRO_FAMILY" == "debian" ]]; then apt_get install "$@"; else dnf -y install "$@"; fi; }
+pkg_installed() {
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        dpkg -s "$1" 2>/dev/null | grep -q '^Status: install ok installed'
+    else
+        rpm -q "$1" >/dev/null 2>&1
+    fi
+}
+pkg_has_candidate() {
+    local p="$1" c
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        c="$(apt-cache policy "$p" 2>/dev/null | awk '/Candidate:/ {print $2}')"
+        [[ -n "$c" && "$c" != "(none)" ]]
+    else
+        dnf -q list --available "$p" >/dev/null 2>&1 || rpm -q "$p" >/dev/null 2>&1
+    fi
+}
+# Daftar paket terpasang yang cocok dengan regex nama (aman, tidak menyentuh paket lain)
+pkgs_matching() {
+    local re="$1"
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        dpkg-query -W -f='${Package}\t${db:Status-Abbrev}\n' 2>/dev/null \
+            | awk -F'\t' '$2 ~ /^(ii|rc)/ {print $1}' | sed 's/:.*//' | grep -E "$re" | sort -u
+    else
+        rpm -qa --qf '%{NAME}\n' 2>/dev/null | grep -E "$re" | sort -u
+    fi
+}
+pkgs_purge() {   # pkgs_purge pkg...
+    (( $# )) || return 0
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then apt_get purge "$@"; else dnf -y remove "$@"; fi
+}
 
-    client_max_body_size 100m;
-    client_body_timeout 120s;
+svc_exists() { systemctl cat "$1.service" >/dev/null 2>&1; }
+first_service() { local s; for s in "$@"; do svc_exists "$s" && { printf '%s' "$s"; return 0; }; done; return 1; }
 
-    sendfile off;
+detect_services() {
+    DB_SERVICE="$(first_service mariadb mysql mysqld || true)"
+    REDIS_SERVICE="$(first_service redis-server redis valkey-server valkey || true)"
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        PHP_FPM_SERVICE="php${PHP_VER}-fpm"
+        PHP_FPM_SOCK="/run/php/php${PHP_VER}-fpm.sock"
+    else
+        PHP_FPM_SERVICE="php-fpm"
+        PHP_FPM_SOCK="/run/php-fpm/pterodactyl.sock"
+    fi
+}
 
-    ssl_certificate /etc/letsencrypt/live/${FQDN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${FQDN}/privkey.pem;
-    ssl_session_cache shared:SSL:10m;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers EECDH+AESGCM:EDH+AESGCM;
-    ssl_prefer_server_ciphers on;
+mysql_bin() { command -v mariadb 2>/dev/null || command -v mysql 2>/dev/null; }
+mysql_root() { local b; b="$(mysql_bin)" || return 127; "$b" -u root "$@"; }
 
-    add_header X-Content-Type-Options nosniff;
-    add_header X-XSS-Protection "1; mode=block";
-    add_header X-Robots-Tag none;
-    add_header Content-Security-Policy "frame-ancestors 'self'";
-    add_header X-Frame-Options DENY;
-    add_header Referrer-Policy same-origin;
+ensure_mysql_access() {   # coba socket auth; kalau gagal minta password root
+    mysql_root -e 'SELECT 1' >/dev/null 2>&1 && return 0
+    warn "Tidak bisa login MariaDB sebagai root tanpa password."
+    local p; read -r -s -p "Password root MariaDB (kosong = batal): " p; echo
+    [[ -z "$p" ]] && return 1
+    export MYSQL_PWD="$p"
+    mysql_root -e 'SELECT 1' >/dev/null 2>&1
+}
 
+###############################################################################
+# FIREWALL & SELINUX
+###############################################################################
+fw_open() {   # fw_open STATE_KEY 80/tcp 443/tcp  (hanya mencatat rule yang benar-benar kita tambah)
+    local key="$1" p; shift
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+        state_set_once FW_TOOL ufw
+        for p in "$@"; do
+            ufw status | grep -qE "^${p%/*}(/${p#*/})?[[:space:]]+ALLOW" && continue
+            ufw allow "$p" >>"$LOG_FILE" 2>&1 && state_append "$key" "$p"
+        done
+        info "Firewall (ufw): port $* dibuka."
+    elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+        state_set_once FW_TOOL firewalld
+        for p in "$@"; do
+            firewall-cmd --query-port="$p" >/dev/null 2>&1 && continue
+            firewall-cmd --permanent --add-port="$p" >>"$LOG_FILE" 2>&1 && state_append "$key" "$p"
+        done
+        firewall-cmd --reload >>"$LOG_FILE" 2>&1
+        info "Firewall (firewalld): port $* dibuka."
+    else
+        info "Tidak ada firewall aktif (ufw/firewalld). Pastikan port $* terbuka di panel provider VPS."
+    fi
+}
+fw_close_recorded() {   # fw_close_recorded STATE_KEY
+    local key="$1" p ports="${!1:-}"
+    [[ -n "${FW_TOOL:-}" && -n "$ports" ]] || return 0
+    for p in $ports; do
+        if [[ "$FW_TOOL" == "ufw" ]] && command -v ufw >/dev/null 2>&1; then
+            ufw --force delete allow "$p" >>"$LOG_FILE" 2>&1 || true
+        elif [[ "$FW_TOOL" == "firewalld" ]] && command -v firewall-cmd >/dev/null 2>&1; then
+            firewall-cmd --permanent --remove-port="$p" >>"$LOG_FILE" 2>&1 || true
+        fi
+    done
+    [[ "$FW_TOOL" == "firewalld" ]] && { firewall-cmd --reload >>"$LOG_FILE" 2>&1 || true; }
+    ok "Rule firewall yang dibuat script ini dihapus (${ports})."
+}
+
+selinux_active() { command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce 2>/dev/null)" != "Disabled" ]]; }
+setup_selinux() {
+    selinux_active || return 0
+    info "SELinux aktif - menyesuaikan konteks untuk Panel..."
+    setsebool -P httpd_can_network_connect 1 >>"$LOG_FILE" 2>&1 || true
+    setsebool -P httpd_can_network_connect_db 1 >>"$LOG_FILE" 2>&1 || true
+    if command -v semanage >/dev/null 2>&1; then
+        semanage fcontext -a -t httpd_sys_rw_content_t "${PANEL_DIR}(/.*)?" >>"$LOG_FILE" 2>&1 \
+            || semanage fcontext -m -t httpd_sys_rw_content_t "${PANEL_DIR}(/.*)?" >>"$LOG_FILE" 2>&1 || true
+        state_set SELINUX_FCONTEXT 1
+    fi
+    restorecon -R "$PANEL_DIR" >>"$LOG_FILE" 2>&1 || true
+}
+
+###############################################################################
+# PHP
+###############################################################################
+find_php_version() {   # find_php_version 8.3 8.2 ... -> set PHP_VER
+    local v
+    for v in "$@"; do
+        if pkg_has_candidate "php${v}-cli" && pkg_has_candidate "php${v}-fpm"; then
+            PHP_VER="$v"; return 0
+        fi
+    done
+    return 1
+}
+
+add_php_repo_debian() {
+    local codename
+    if is_ubuntu_like; then
+        run "Install software-properties-common" pkg_install software-properties-common || return 1
+        run "Tambah PPA ondrej/php" env LC_ALL=C.UTF-8 add-apt-repository -y ppa:ondrej/php || return 1
+        state_set REPO_PHP ondrej
+    else
+        codename="${DEBIAN_CODENAME:-$OS_CODENAME}"
+        [[ -n "$codename" ]] || return 1
+        run "Unduh keyring sury.org" curl -fsSLo /tmp/debsuryorg-archive-keyring.deb \
+            https://packages.sury.org/debsuryorg-archive-keyring.deb || return 1
+        run "Pasang keyring sury.org" dpkg -i /tmp/debsuryorg-archive-keyring.deb || return 1
+        echo "deb [signed-by=/usr/share/keyrings/deb.sury.org-php.gpg] https://packages.sury.org/php/ ${codename} main" \
+            >/etc/apt/sources.list.d/php-sury.list
+        state_set REPO_PHP sury
+    fi
+    run_soft "Update daftar paket" pkg_update
+    return 0
+}
+
+remove_php_repo_debian() {
+    rm -f /etc/apt/sources.list.d/ondrej-*.list /etc/apt/sources.list.d/ondrej-*.sources \
+          /etc/apt/trusted.gpg.d/ondrej-* /etc/apt/keyrings/ondrej-* \
+          /etc/apt/sources.list.d/php-sury.list /etc/apt/sources.list.d/php.list \
+          /usr/share/keyrings/deb.sury.org-php.gpg
+    dpkg -P debsuryorg-archive-keyring >>"$LOG_FILE" 2>&1 || true
+}
+
+install_php_debian() {
+    PHP_VER=""
+    find_php_version 8.3 8.2 || true
+    if [[ -z "$PHP_VER" ]]; then
+        info "PHP 8.2/8.3 tidak ada di repo bawaan ${OS_PRETTY}; mencoba repo PHP tambahan (Ondrej/Sury)..."
+        add_php_repo_debian || warn "Repo PHP tambahan gagal ditambahkan; mencoba paket yang tersedia."
+        find_php_version 8.3 8.2 8.4 8.5 || true
+        if [[ -z "$PHP_VER" ]]; then
+            remove_php_repo_debian; run_soft "Update daftar paket" pkg_update
+            die "Tidak menemukan PHP 8.2+ untuk ${OS_PRETTY}."
+        fi
+    fi
+    info "PHP yang dipakai: ${PHP_VER}"
+    flag_preexisting INST_PHP pkg_installed "php${PHP_VER}-cli"
+    local pk=(cli fpm common gd mysql mbstring bcmath xml curl zip)
+    local list=() p
+    for p in "${pk[@]}"; do list+=("php${PHP_VER}-${p}"); done
+    run_or_die "Install PHP ${PHP_VER} + ekstensi" pkg_install "${list[@]}"
+    pkg_has_candidate "php${PHP_VER}-intl" && run_soft "Install php${PHP_VER}-intl" pkg_install "php${PHP_VER}-intl"
+    PHP_BIN="$(command -v "php${PHP_VER}" || true)"
+    [[ -n "$PHP_BIN" ]] || PHP_BIN="$(command -v php)"
+    state_set PANEL_PHP_VER "$PHP_VER"
+}
+
+install_epel_rhel() {
+    [[ "$OS_ID" == "fedora" ]] && return 0
+    rpm -q epel-release >/dev/null 2>&1 && return 0
+    if run "Install EPEL" dnf -y install epel-release; then :
+    elif [[ "$OS_ID" == "ol" ]] && run "Install EPEL (Oracle)" dnf -y install "oracle-epel-release-el${EL_MAJOR}"; then :
+    else
+        run "Install EPEL (URL)" dnf -y install "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${EL_MAJOR}.noarch.rpm" || return 1
+    fi
+    state_set REPO_EPEL 1
+    run_soft "Aktifkan CRB/PowerTools" bash -c 'dnf -y install dnf-plugins-core; (crb enable || dnf config-manager --set-enabled crb || dnf config-manager --set-enabled powertools)'
+    return 0
+}
+
+install_php_rhel() {
+    local streams stream=""
+    PHP_VER=""
+    flag_preexisting INST_PHP rpm -q php-cli
+    if [[ "$OS_ID" != "fedora" ]] && (( EL_MAJOR < 10 )); then
+        streams="$(dnf -q module list --all php 2>/dev/null | awk '$1=="php"{print $2}' | sort -u)"
+        if   grep -qx '8.3' <<<"$streams"; then stream="8.3"
+        elif grep -qx '8.2' <<<"$streams"; then stream="8.2"
+        else
+            info "Modul PHP 8.2/8.3 tidak ada di repo bawaan; memakai repo Remi."
+            run_or_die "Pasang repo Remi" dnf -y install "https://rpms.remirepo.net/enterprise/remi-release-${EL_MAJOR}.rpm"
+            state_set REPO_REMI 1
+            stream="remi-8.3"
+        fi
+        run_or_die "Aktifkan modul php:${stream}" bash -c "dnf -y module reset php && dnf -y module enable php:${stream}"
+        state_set PHP_MODULE_ENABLED "$stream"
+    fi
+    run_or_die "Install PHP + ekstensi" pkg_install php-cli php-fpm php-common php-gd php-mysqlnd php-mbstring php-bcmath php-xml php-pdo
+    local o
+    for o in php-zip php-intl php-process php-opcache php-sodium; do
+        pkg_has_candidate "$o" && run_soft "Install $o" pkg_install "$o"
+    done
+    PHP_BIN="$(command -v php)"
+    PHP_VER="$("$PHP_BIN" -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
+    state_set PANEL_PHP_VER "$PHP_VER"
+}
+
+configure_phpfpm_rhel() {
+    mkdir -p /run/php-fpm
+    cat >/etc/php-fpm.d/pterodactyl.conf <<EOF
+[pterodactyl]
+user = ${WEB_USER}
+group = ${WEB_GROUP}
+listen = ${PHP_FPM_SOCK}
+listen.owner = ${WEB_USER}
+listen.group = ${WEB_GROUP}
+listen.mode = 0660
+pm = dynamic
+pm.max_children = 20
+pm.start_servers = 3
+pm.min_spare_servers = 2
+pm.max_spare_servers = 6
+EOF
+    state_set PHPFPM_POOL 1
+    systemctl enable "$PHP_FPM_SERVICE" >>"$LOG_FILE" 2>&1
+    systemctl restart "$PHP_FPM_SERVICE"
+}
+
+check_php_policy() {
+    case "$PHP_VER" in
+        8.2|8.3) IGNORE_PHP_PLATFORM=0 ;;
+        *) IGNORE_PHP_PLATFORM=1
+           warn "PHP ${PHP_VER} lebih baru dari yang dijamin Panel (8.2/8.3). Instalasi tetap dicoba, jika ada masalah gunakan PHP 8.3." ;;
+    esac
+}
+
+###############################################################################
+# DEPENDENCY
+###############################################################################
+port_owner() {
+    ss -ltnpH "( sport = :$1 )" 2>/dev/null | grep -oE 'users:\(\("[^"]+"' | head -1 | cut -d'"' -f2
+}
+free_web_ports() {
+    local port owner
+    for port in 80 443; do
+        owner="$(port_owner "$port" || true)"
+        [[ -z "$owner" || "$owner" == "nginx" ]] && continue
+        warn "Port ${port} sedang dipakai oleh '${owner}'."
+        case "$owner" in
+            apache2|httpd)
+                if confirm "Stop & nonaktifkan ${owner} supaya Nginx bisa jalan?" y; then
+                    systemctl disable --now apache2 httpd >>"$LOG_FILE" 2>&1 || true
+                else die "Port ${port} harus bebas untuk Nginx."; fi ;;
+            *) die "Hentikan '${owner}' dulu, lalu jalankan ulang script ini." ;;
+        esac
+    done
+}
+
+install_base_packages() {
+    local need=() c
+    for c in curl wget tar unzip git; do command -v "$c" >/dev/null 2>&1 || need+=("$c"); done
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        need+=(ca-certificates gnupg cron openssl iproute2)
+        run_soft "Update daftar paket" pkg_update
+        run_or_die "Install paket dasar" pkg_install "${need[@]}"
+        systemctl enable --now cron >>"$LOG_FILE" 2>&1 || true
+    else
+        need+=(ca-certificates gnupg2 cronie openssl iproute policycoreutils-python-utils)
+        run_or_die "Install paket dasar" pkg_install "${need[@]}"
+        systemctl enable --now crond >>"$LOG_FILE" 2>&1 || true
+    fi
+}
+
+install_composer() {
+    flag_preexisting INST_COMPOSER command -v composer
+    if ! command -v composer >/dev/null 2>&1; then
+        run_or_die "Unduh Composer" curl -fsSL https://getcomposer.org/download/latest-stable/composer.phar -o /usr/local/bin/composer
+        chmod +x /usr/local/bin/composer
+    fi
+    run_or_die "Cek Composer" "$PHP_BIN" /usr/local/bin/composer --version
+}
+
+install_dependencies() {
+    step "Memasang dependency (${DISTRO_FAMILY})"
+    install_base_packages
+    free_web_ports
+
+    flag_preexisting INST_NGINX   command -v nginx
+    flag_preexisting INST_MARIADB bash -c 'command -v mariadbd || command -v mysqld || [[ -x /usr/sbin/mariadbd || -x /usr/sbin/mysqld ]]'
+    flag_preexisting INST_REDIS   bash -c 'command -v redis-server || command -v valkey-server'
+    flag_preexisting INST_CERTBOT command -v certbot
+
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        install_php_debian
+        run_or_die "Install MariaDB" pkg_install mariadb-server
+        run_or_die "Install Nginx" pkg_install nginx
+        if   pkg_has_candidate redis-server; then run_or_die "Install Redis" pkg_install redis-server
+        elif pkg_has_candidate valkey-server; then run_or_die "Install Valkey (pengganti Redis)" pkg_install valkey-server
+        else die "Paket Redis/Valkey tidak ditemukan."; fi
+        (( USE_SSL )) && run_or_die "Install Certbot" pkg_install certbot
+    else
+        install_epel_rhel || warn "EPEL gagal dipasang; Certbot mungkin tidak tersedia."
+        install_php_rhel
+        run_or_die "Install MariaDB" pkg_install mariadb-server
+        run_or_die "Install Nginx" pkg_install nginx
+        if   pkg_has_candidate redis;  then run_or_die "Install Redis" pkg_install redis
+        elif pkg_has_candidate valkey; then run_or_die "Install Valkey (pengganti Redis)" pkg_install valkey
+        else die "Paket Redis/Valkey tidak ditemukan."; fi
+        if (( USE_SSL )); then run_soft "Install Certbot" pkg_install certbot; fi
+        # MariaDB di RHEL secara default listen ke semua interface -> kunci ke localhost
+        mkdir -p /etc/my.cnf.d
+        printf '[mysqld]\nbind-address=127.0.0.1\n' >/etc/my.cnf.d/zz-pterodactyl-bind.cnf
+        state_set MARIADB_BIND_CNF 1
+    fi
+
+    detect_services
+    [[ -n "$DB_SERVICE" ]]    || die "Service MariaDB tidak ditemukan."
+    [[ -n "$REDIS_SERVICE" ]] || die "Service Redis/Valkey tidak ditemukan."
+    check_php_policy
+    install_composer
+
+    [[ "$DISTRO_FAMILY" == "rhel" ]] && configure_phpfpm_rhel
+    run_or_die "Aktifkan MariaDB & Redis & PHP-FPM" systemctl enable --now "$DB_SERVICE" "$REDIS_SERVICE" "$PHP_FPM_SERVICE"
+    state_set PANEL_WEB_USER "$WEB_USER"
+}
+
+###############################################################################
+# NGINX
+###############################################################################
+nginx_supports_http2_directive() {   # nginx >= 1.25.1 memakai 'http2 on;'
+    local v
+    v="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    [[ -n "$v" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "1.25.1" "$v" | sort -V | head -1)" == "1.25.1" ]]
+}
+
+nginx_conf_path() {
+    if [[ -d /etc/nginx/sites-enabled ]]; then echo "/etc/nginx/sites-available/pterodactyl.conf"
+    else echo "/etc/nginx/conf.d/pterodactyl.conf"; fi
+}
+
+nginx_php_locations() {
+    cat <<EOF
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
@@ -346,141 +637,290 @@ server {
     location ~ /\.ht {
         deny all;
     }
-}
 EOF
-)
-
-    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-        rm -f /etc/nginx/sites-enabled/default
-        echo "$NGINX_TEMPLATE" > /etc/nginx/sites-available/pterodactyl.conf
-        ln -sf /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf
-    else
-        echo "$NGINX_TEMPLATE" > /etc/nginx/conf.d/pterodactyl.conf
-    fi
-
-    nginx -t
-    systemctl start nginx
-    systemctl enable nginx
-
-    # Simpan info instalasi (domain, nama DB, user DB) supaya bisa ditampilkan
-    # lagi otomatis saat Uninstall Panel (menu 3), biar tidak perlu diingat manual.
-    cat > /root/.installerptd-info <<EOF
-PANEL_FQDN="${FQDN}"
-PANEL_DB_NAME="${DBNAME}"
-PANEL_DB_USER="${DBUSER}"
-EOF
-    chmod 600 /root/.installerptd-info
-
-    echo ""
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN} Panel berhasil diinstal!${NC}"
-    echo -e "${GREEN} Akses: https://${FQDN}${NC}"
-    echo -e "${GREEN}=============================================${NC}"
-    echo -e "${YELLOW}Buka firewall untuk port 80 dan 443:${NC}"
-    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-        echo "  ufw allow 80/tcp && ufw allow 443/tcp"
-    else
-        echo "  firewall-cmd --permanent --add-port=80/tcp --add-port=443/tcp && firewall-cmd --reload"
-    fi
-    echo ""
-    echo -e "${YELLOW}Lanjut buat Location & Node di Admin Panel, lalu pilih menu 2 (Install Wings) di script ini.${NC}"
 }
 
-###############################################################################
-# 2) INSTALL & AKTIFKAN WINGS
-###############################################################################
-install_wings() {
-    echo -e "${GREEN}=== Install & Aktifkan Wings ===${NC}"
-    echo ""
-    echo "Sebelum lanjut, pastikan kamu sudah membuat Node di Panel"
-    echo "(Admin > Nodes > Create), lalu buka tab 'Configuration' pada node tsb."
-    echo ""
+# write_nginx_conf http|ssl
+write_nginx_conf() {
+    local mode="$1" conf listen_ssl="listen 443 ssl http2;" http2_line=""
+    conf="$(nginx_conf_path)"
+    if nginx_supports_http2_directive; then listen_ssl="listen 443 ssl;"; http2_line="    http2 on;"; fi
+    mkdir -p "$ACME_ROOT" "$(dirname "$conf")"
 
-    echo -e "${GREEN}[1/3] Install Docker...${NC}"
-    if ! command -v docker &> /dev/null; then
-        curl -sSL https://get.docker.com/ | CHANNEL=stable sh
-        systemctl enable --now docker
+    if [[ "$mode" == "ssl" ]]; then
+        cat >"$conf" <<EOF
+server {
+    listen 80;
+    server_name ${FQDN};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_ROOT};
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+
+server {
+    ${listen_ssl}
+${http2_line}
+    server_name ${FQDN};
+
+    root ${PANEL_DIR}/public;
+    index index.php;
+
+    access_log /var/log/nginx/pterodactyl.app-access.log;
+    error_log  /var/log/nginx/pterodactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    ssl_certificate /etc/letsencrypt/live/${FQDN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${FQDN}/privkey.pem;
+    ssl_session_cache shared:SSL:10m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers on;
+
+    add_header X-Content-Type-Options nosniff;
+    add_header X-XSS-Protection "1; mode=block";
+    add_header X-Robots-Tag none;
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    add_header X-Frame-Options DENY;
+    add_header Referrer-Policy same-origin;
+
+$(nginx_php_locations)
+}
+EOF
     else
-        echo "Docker sudah terinstal, lanjut."
+        cat >"$conf" <<EOF
+server {
+    listen 80;
+    server_name ${FQDN};
+
+    root ${PANEL_DIR}/public;
+    index index.php;
+
+    access_log /var/log/nginx/pterodactyl.app-access.log;
+    error_log  /var/log/nginx/pterodactyl.app-error.log error;
+
+    client_max_body_size 100m;
+    client_body_timeout 120s;
+    sendfile off;
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${ACME_ROOT};
+        try_files \$uri =404;
+    }
+
+    add_header X-Content-Type-Options nosniff;
+    add_header X-Robots-Tag none;
+    add_header Content-Security-Policy "frame-ancestors 'self'";
+    add_header X-Frame-Options DENY;
+    add_header Referrer-Policy same-origin;
+
+$(nginx_php_locations)
+}
+EOF
     fi
 
-    echo -e "${GREEN}[2/3] Download binary Wings...${NC}"
-    mkdir -p /etc/pterodactyl
-    ARCH=$(uname -m)
-    if [[ "$ARCH" == "x86_64" ]]; then
-        WINGS_ARCH="amd64"
-    else
-        WINGS_ARCH="arm64"
+    if [[ "$conf" == /etc/nginx/sites-available/* ]]; then
+        ln -sf "$conf" /etc/nginx/sites-enabled/pterodactyl.conf
+        # site default hanya dihapus jika Nginx dipasang oleh script ini
+        if [[ "${INST_NGINX:-0}" == "1" ]]; then rm -f /etc/nginx/sites-enabled/default; fi
     fi
-    curl -L -o /usr/local/bin/wings "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${WINGS_ARCH}"
-    chmod u+x /usr/local/bin/wings
+    state_set PANEL_NGINX_CONF "$conf"
+}
 
-    echo -e "${GREEN}[3/3] Konfigurasi Wings dari Panel${NC}"
-    echo ""
-    echo -e "${CYAN}Buka: Panel > Admin > Nodes > [Node Kamu] > tab 'Configuration'${NC}"
-    echo -e "${CYAN}Copy SELURUH baris perintah yang muncul di sana, formatnya seperti ini:${NC}"
-    echo -e "${CYAN}  cd /etc/pterodactyl && sudo wings configure --panel-url https://panel.contoh.com --token ptlc_xxxxx --node 1${NC}"
-    echo ""
-    echo -e "${YELLOW}Catatan: token tersebut hanya berlaku sekitar 5 menit sejak ditampilkan.${NC}"
-    echo -e "${YELLOW}Kalau sudah expired/gagal, buka ulang tab Configuration di Panel untuk dapat kode baru,${NC}"
-    echo -e "${YELLOW}lalu paste lagi di bawah ini. Kamu akan diberi kesempatan mencoba sampai 3 kali.${NC}"
-    echo ""
+nginx_apply() {
+    nginx -t >>"$LOG_FILE" 2>&1 || { nginx -t 2>&1 | tail -n 8; return 1; }
+    systemctl enable nginx >>"$LOG_FILE" 2>&1
+    systemctl restart nginx
+}
 
-    MAX_TRY=3
-    TRY=1
-    SUCCESS=0
-
-    while [[ $TRY -le $MAX_TRY ]]; do
-        echo -e "${GREEN}Percobaan ${TRY} dari ${MAX_TRY}${NC}"
-        read -p "Paste perintah configuration dari Panel di sini: " WINGS_CONFIG_CMD
-
-        if [[ -z "$WINGS_CONFIG_CMD" ]]; then
-            echo -e "${RED}Tidak ada input, coba lagi.${NC}"
-            TRY=$((TRY+1))
-            continue
-        fi
-
-        # Perintah resmi dari Panel selalu mengandung "wings configure",
-        # baik diawali "cd /etc/pterodactyl && sudo wings configure ..."
-        # atau langsung "sudo wings configure ..."
-        if [[ "$WINGS_CONFIG_CMD" != *"wings configure"* ]]; then
-            echo -e "${RED}Perintah tidak dikenali (harus mengandung 'wings configure'). Coba lagi.${NC}"
-            TRY=$((TRY+1))
-            continue
-        fi
-
-        echo -e "${GREEN}Menjalankan konfigurasi...${NC}"
-        # eval menjalankan perintah apa adanya, termasuk bagian 'cd ... &&' jika ada
-        if eval "$WINGS_CONFIG_CMD"; then
-            SUCCESS=1
-            break
+setup_ssl() {
+    USE_SSL=0
+    [[ "$WANT_SSL" == "1" ]] || return 0
+    command -v certbot >/dev/null 2>&1 || { warn "Certbot tidak tersedia, lanjut tanpa SSL (HTTP)."; return 0; }
+    if run "Minta sertifikat Let's Encrypt untuk ${FQDN}" certbot certonly --webroot -w "$ACME_ROOT" \
+        -d "$FQDN" --non-interactive --agree-tos --no-eff-email -m "$EMAIL"; then
+        write_nginx_conf ssl
+        if nginx_apply; then
+            USE_SSL=1
+            state_set PANEL_SSL 1
+            enable_cert_renewal
         else
-            echo -e "${RED}Gagal mengonfigurasi Wings. Token mungkin sudah expired.${NC}"
-            echo -e "${YELLOW}Ambil kode baru dari tab Configuration di Panel, lalu coba lagi.${NC}"
-            TRY=$((TRY+1))
+            warn "Konfigurasi SSL gagal dites, kembali ke HTTP."
+            write_nginx_conf http; nginx_apply || true
         fi
+    else
+        warn "Sertifikat SSL gagal (DNS belum mengarah ke VPS ini / port 80 tertutup?)."
+        warn "Panel dipasang dengan HTTP dulu. Setelah DNS benar jalankan: certbot certonly --webroot -w ${ACME_ROOT} -d ${FQDN}"
+    fi
+}
+
+enable_cert_renewal() {
+    if systemctl list-unit-files 2>/dev/null | grep -q '^certbot.timer'; then
+        systemctl enable --now certbot.timer >>"$LOG_FILE" 2>&1 || true
+    elif systemctl list-unit-files 2>/dev/null | grep -q '^certbot-renew.timer'; then
+        systemctl enable --now certbot-renew.timer >>"$LOG_FILE" 2>&1 || true
+    else
+        printf '0 3 * * * root certbot renew -q --deploy-hook "systemctl reload nginx"\n' >/etc/cron.d/installerptd-certbot
+        chmod 644 /etc/cron.d/installerptd-certbot
+    fi
+}
+
+###############################################################################
+# 1) INSTALL PANEL
+###############################################################################
+resolve_ipv4() { getent ahostsv4 "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+public_ipv4()  { curl -fsS4 --max-time 6 https://api.ipify.org 2>/dev/null || curl -fsS4 --max-time 6 https://ifconfig.me 2>/dev/null; }
+
+collect_panel_inputs() {
+    echo -e "${CYAN}Isi data berikut. Tekan Enter untuk memakai nilai default [dalam kurung].${NC}\n"
+    ask FQDN "Domain Panel (contoh: panel.contoh.com) atau IP VPS" "" is_host "Domain/IP tidak valid."
+    FQDN="${FQDN,,}"
+    ask EMAIL "Email (untuk SSL, author egg, dan akun admin)" "" is_email "Format email tidak valid (contoh: nama@domain.com)."
+    ask ADMIN_USER "Username admin Panel" "admin" is_username "Username min. 3 karakter (huruf/angka/_ . -)."
+    ask ADMIN_FIRST "Nama depan admin" "Admin" is_nonempty
+    ask ADMIN_LAST "Nama belakang admin" "User" is_nonempty
+    ask_secret ADMIN_PASS "Password admin Panel (min 8, huruf besar+kecil+angka)" is_admin_pass \
+        "Password harus min. 8 karakter dan mengandung huruf besar, huruf kecil, dan angka."
+    ask DBNAME "Nama database" "panel" is_ident "Hanya huruf/angka/underscore (maks 32)."
+    ask DBUSER "Nama user database" "pterodactyl" is_ident "Hanya huruf/angka/underscore (maks 32)."
+
+    local p
+    while true; do
+        read -r -s -p "Password database (kosong = dibuat acak otomatis): " p || die "Input dihentikan."; echo
+        p="${p//$'\r'/}"
+        if [[ -z "$p" ]]; then DBPASS="$(random_pass)"; DBPASS_GENERATED=1; break; fi
+        if is_db_pass "$p"; then DBPASS="$p"; DBPASS_GENERATED=0; break; fi
+        warn "Min. 8 karakter, tanpa spasi dan tanpa karakter  ' \" \\ \$ \`"
     done
 
-    if [[ $SUCCESS -ne 1 ]]; then
-        echo -e "${RED}Gagal konfigurasi Wings setelah ${MAX_TRY} kali percobaan.${NC}"
-        echo "Jalankan ulang menu 2 di script ini untuk mencoba lagi."
-        return
+    local def_tz="Asia/Jakarta"
+    [[ -r /etc/timezone ]] && is_tz "$(cat /etc/timezone)" && def_tz="$(cat /etc/timezone)"
+    ask TZONE "Zona waktu" "$def_tz" is_tz "Zona waktu tidak dikenal (contoh: Asia/Jakarta)."
+
+    WANT_SSL=0
+    if is_fqdn "$FQDN"; then
+        if confirm "Pasang SSL gratis Let's Encrypt (HTTPS)?" y; then WANT_SSL=1; fi
+        local dns_ip my_ip
+        dns_ip="$(resolve_ipv4 "$FQDN")"; my_ip="$(public_ipv4 || true)"
+        if [[ -z "$dns_ip" ]]; then
+            warn "Domain ${FQDN} belum punya A record."
+        elif [[ -n "$my_ip" && "$dns_ip" != "$my_ip" ]]; then
+            warn "Domain mengarah ke ${dns_ip}, sedangkan IP VPS ini ${my_ip}."
+            warn "Jika memakai proxy Cloudflare abaikan; selain itu SSL akan gagal."
+        else
+            ok "DNS ${FQDN} -> ${dns_ip} sesuai."
+        fi
+    else
+        info "Memakai IP address -> SSL dinonaktifkan (Let's Encrypt butuh domain)."
     fi
 
-    echo -e "${GREEN}Konfigurasi berhasil. Menyiapkan systemd service...${NC}"
+    echo ""
+    echo -e "${YELLOW}Ringkasan:${NC}"
+    echo "  Domain   : ${FQDN}   (SSL: $([[ $WANT_SSL == 1 ]] && echo ya || echo tidak))"
+    echo "  Email    : ${EMAIL}"
+    echo "  Admin    : ${ADMIN_USER} (${ADMIN_FIRST} ${ADMIN_LAST})"
+    echo "  Database : ${DBNAME} / user ${DBUSER}"
+    echo "  Timezone : ${TZONE}"
+    echo ""
+    confirm "Lanjut instalasi?" y || { warn "Dibatalkan."; exit 0; }
+}
 
-    cat > /etc/systemd/system/wings.service <<'EOF'
+db_create() {
+    local esc="${DBPASS//\\/\\\\}"; esc="${esc//\'/\\\'}"
+    mysql_root <<SQL
+CREATE DATABASE IF NOT EXISTS \`${DBNAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+CREATE USER IF NOT EXISTS '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${esc}';
+ALTER USER '${DBUSER}'@'127.0.0.1' IDENTIFIED BY '${esc}';
+GRANT ALL PRIVILEGES ON \`${DBNAME}\`.* TO '${DBUSER}'@'127.0.0.1' WITH GRANT OPTION;
+FLUSH PRIVILEGES;
+SQL
+}
+
+download_panel() {
+    mkdir -p "$PANEL_DIR"
+    cd "$PANEL_DIR" || return 1
+    curl -fsSL --retry 3 -o panel.tar.gz https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz || return 1
+    tar -xzf panel.tar.gz || return 1
+    rm -f panel.tar.gz
+    chmod -R 755 storage/* bootstrap/cache/
+    cp .env.example .env
+}
+
+composer_install_panel() {
+    cd "$PANEL_DIR" || return 1
+    export COMPOSER_ALLOW_SUPERUSER=1 COMPOSER_MEMORY_LIMIT=-1
+    local extra=()
+    (( IGNORE_PHP_PLATFORM )) && extra+=(--ignore-platform-req=php)
+    if ! "$PHP_BIN" /usr/local/bin/composer install --no-dev --optimize-autoloader --no-interaction ${extra[@]+"${extra[@]}"}; then
+        echo "Composer gagal, mencoba ulang dengan --ignore-platform-req=php ..."
+        "$PHP_BIN" /usr/local/bin/composer install --no-dev --optimize-autoloader --no-interaction --ignore-platform-req=php
+    fi
+}
+
+# Pastikan email lolos FILTER_VALIDATE_EMAIL milik PHP (validator yang dipakai Panel)
+ensure_php_valid_email() {
+    while ! "$PHP_BIN" -r 'exit(filter_var($argv[1], FILTER_VALIDATE_EMAIL) ? 0 : 1);' "$EMAIL" 2>/dev/null; do
+        warn "Email '${EMAIL}' ditolak validator PHP/Panel."
+        ask EMAIL "Masukkan email lain" "" is_email "Format email tidak valid."
+    done
+}
+
+configure_panel_env() {
+    cd "$PANEL_DIR" || return 1
+    local url="http://${FQDN}"
+    (( USE_SSL )) && url="https://${FQDN}"
+    ensure_php_valid_email
+
+    "$PHP_BIN" artisan key:generate --force --no-interaction || return 1
+
+    # SEMUA opsi diberikan -> tidak ada prompt interaktif yang bisa gagal
+    "$PHP_BIN" artisan p:environment:setup --no-interaction \
+        --new-salt \
+        --author="$EMAIL" \
+        --url="$url" \
+        --timezone="$TZONE" \
+        --cache=redis --session=redis --queue=redis \
+        --redis-host=127.0.0.1 --redis-pass=null --redis-port=6379 \
+        --settings-ui=true \
+        --telemetry=0 || return 1
+
+    "$PHP_BIN" artisan p:environment:database --no-interaction \
+        --host=127.0.0.1 --port=3306 \
+        --database="$DBNAME" --username="$DBUSER" --password="$DBPASS" || return 1
+
+    "$PHP_BIN" artisan migrate --seed --force --no-interaction || return 1
+
+    "$PHP_BIN" artisan p:user:make --no-interaction \
+        --email="$EMAIL" --username="$ADMIN_USER" \
+        --name-first="$ADMIN_FIRST" --name-last="$ADMIN_LAST" \
+        --password="$ADMIN_PASS" --admin=1 || return 1
+}
+
+setup_panel_services() {
+    chown -R "${WEB_USER}:${WEB_GROUP}" "$PANEL_DIR"
+    chmod -R 755 "$PANEL_DIR/storage" "$PANEL_DIR/bootstrap/cache"
+
+    printf '* * * * * %s %s %s/artisan schedule:run >> /dev/null 2>&1\n' "$WEB_USER" "$PHP_BIN" "$PANEL_DIR" >/etc/cron.d/pterodactyl
+    chmod 644 /etc/cron.d/pterodactyl
+
+    cat >/etc/systemd/system/pteroq.service <<EOF
 [Unit]
-Description=Pterodactyl Wings Daemon
-After=docker.service
-Requires=docker.service
-PartOf=docker.service
+Description=Pterodactyl Queue Worker
+After=${REDIS_SERVICE}.service ${DB_SERVICE}.service
 
 [Service]
-LimitNOFILE=4096
-PIDFile=/var/run/wings/daemon.pid
-ExecStart=/usr/local/bin/wings
-Restart=on-failure
+User=${WEB_USER}
+Group=${WEB_GROUP}
+Restart=always
+ExecStart=${PHP_BIN} ${PANEL_DIR}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3
 StartLimitInterval=180
 StartLimitBurst=30
 RestartSec=5
@@ -488,321 +928,604 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-
     systemctl daemon-reload
-    systemctl enable --now wings
+    systemctl enable --now pteroq.service
+}
+
+install_panel() {
+    step "Install Pterodactyl Panel"
+    if [[ -f "$PANEL_DIR/artisan" || -f "$PANEL_DIR/.env" ]]; then
+        err "Panel sudah ada di ${PANEL_DIR}."
+        echo "Jalankan menu 3 (Uninstall Panel) dulu jika ingin install ulang dari nol."
+        return 1
+    fi
+
+    collect_panel_inputs
+    state_set PANEL_FQDN "$FQDN"; state_set PANEL_DB_NAME "$DBNAME"; state_set PANEL_DB_USER "$DBUSER"
+    state_set DISTRO_FAMILY_USED "$DISTRO_FAMILY"; state_set PANEL_SSL 0
+
+    install_dependencies
+
+    step "Menyiapkan database"
+    ensure_mysql_access || die "Tidak bisa mengakses MariaDB sebagai root."
+    run_or_die "Buat database & user" db_create
+
+    step "Mengunduh Panel & library (Composer)"
+    run_or_die "Unduh & ekstrak Panel" download_panel
+    echo "  Menjalankan composer install (beberapa menit)..."
+    composer_install_panel >>"$LOG_FILE" 2>&1 || die "composer install gagal. Lihat ${LOG_FILE}."
+    ok "Library Panel terpasang."
+
+    step "Konfigurasi Nginx & SSL"
+    write_nginx_conf http
+    nginx_apply || die "Konfigurasi Nginx tidak valid."
+    setup_ssl
+    fw_open FW_PORTS_PANEL 80/tcp 443/tcp
+
+    step "Konfigurasi environment Panel"
+    configure_panel_env || die "Konfigurasi environment/migrasi/admin gagal. Lihat output di atas dan ${LOG_FILE}."
+    ok "Environment, database & akun admin siap."
+
+    step "Service & permission"
+    setup_selinux
+    run_or_die "Cron + queue worker (pteroq)" setup_panel_services
+    state_set PANEL_INSTALLED 1
+
+    local scheme="http"; (( USE_SSL )) && scheme="https"
+    echo ""
+    echo -e "${GREEN}=============================================${NC}"
+    echo -e "${GREEN} Panel berhasil diinstal!${NC}"
+    echo -e "${GREEN} Akses     : ${scheme}://${FQDN}${NC}"
+    echo -e "${GREEN} Admin     : ${ADMIN_USER}  (${EMAIL})${NC}"
+    echo -e "${GREEN} Database  : ${DBNAME} / ${DBUSER}${NC}"
+    if [[ "${DBPASS_GENERATED:-0}" == "1" ]]; then
+        echo -e "${GREEN} DB Pass   : ${DBPASS}   (dibuat otomatis, CATAT sekarang)${NC}"
+    fi
+    echo -e "${GREEN}=============================================${NC}"
+    (( USE_SSL )) || warn "Panel masih HTTP. Aktifkan HTTPS setelah DNS benar (lihat pesan di atas)."
+    echo -e "${YELLOW}Lanjut: buat Location & Node di Admin Panel, lalu pilih menu 2 (Install Wings).${NC}"
+    echo -e "${YELLOW}Jika ada firewall di panel provider VPS, buka port 80 & 443.${NC}"
+}
+
+###############################################################################
+# 2) INSTALL WINGS
+###############################################################################
+install_docker() {
+    flag_preexisting INST_DOCKER command -v docker
+    if command -v docker >/dev/null 2>&1; then
+        info "Docker sudah terpasang."
+    else
+        run_or_die "Unduh installer Docker" curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        if ! run "Install Docker (get.docker.com)" sh /tmp/get-docker.sh; then
+            warn "get.docker.com gagal, mencoba cara manual..."
+            if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+                run_or_die "Install docker.io" pkg_install docker.io
+            else
+                local repo="centos"; [[ "$OS_ID" == "fedora" ]] && repo="fedora"
+                run_or_die "Tambah repo Docker" curl -fsSL "https://download.docker.com/linux/${repo}/docker-ce.repo" -o /etc/yum.repos.d/docker-ce.repo
+                run_or_die "Install Docker CE" pkg_install docker-ce docker-ce-cli containerd.io
+            fi
+        fi
+        rm -f /tmp/get-docker.sh
+    fi
+    run_or_die "Aktifkan Docker" systemctl enable --now docker
+}
+
+wings_arg() {   # wings_arg --panel-url "<cmd>"
+    grep -oE -- "$1[= ]+[^ ]+" <<<"$2" | head -1 | sed -E "s/^$1[= ]+//; s/^[\"']//; s/[\"']\$//"
+}
+
+install_wings() {
+    step "Install & Aktifkan Wings"
+    echo "Pastikan Node sudah dibuat di Panel (Admin > Nodes > Create),"
+    echo "lalu buka tab 'Configuration' pada node tersebut."
+    echo ""
+
+    local arch warch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) warch="amd64" ;;
+        aarch64|arm64) warch="arm64" ;;
+        *) die "Arsitektur ${arch} tidak didukung Wings." ;;
+    esac
+
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then run_soft "Update daftar paket" pkg_update; fi
+    local need=() c
+    for c in curl tar; do command -v "$c" >/dev/null 2>&1 || need+=("$c"); done
+    (( ${#need[@]} )) && run_or_die "Install paket dasar" pkg_install "${need[@]}" ca-certificates
+
+    install_docker
+
+    mkdir -p /etc/pterodactyl
+    run_or_die "Unduh binary Wings" curl -fsSL --retry 3 -o /usr/local/bin/wings \
+        "https://github.com/pterodactyl/wings/releases/latest/download/wings_linux_${warch}"
+    chmod u+x /usr/local/bin/wings
+    state_set WINGS_INSTALLED 1
+
+    echo -e "\n${CYAN}Copy SELURUH perintah dari tab 'Configuration' di Panel, contoh:${NC}"
+    echo -e "${CYAN}  cd /etc/pterodactyl && sudo wings configure --panel-url https://panel.contoh.com --token ptlc_xxxxx --node 1${NC}"
+    echo -e "${YELLOW}Token hanya berlaku beberapa menit. Kamu punya 3 kali percobaan.${NC}\n"
+
+    local try=1 cmd url token node insecure_flag success=0
+    while (( try <= 3 )); do
+        echo -e "${GREEN}Percobaan ${try} dari 3${NC}"
+        read -r -p "Paste perintah configuration: " cmd || die "Input dihentikan."
+        cmd="$(trim "$cmd")"
+        if [[ "$cmd" != *"wings configure"* ]]; then
+            warn "Perintah harus mengandung 'wings configure'."; try=$((try+1)); continue
+        fi
+        url="$(wings_arg --panel-url "$cmd")"; token="$(wings_arg --token "$cmd")"; node="$(wings_arg --node "$cmd")"
+        if [[ ! "$url" =~ ^https?:// || -z "$token" || ! "$node" =~ ^[0-9]+$ ]]; then
+            warn "Tidak bisa membaca --panel-url / --token / --node dari perintah itu."; try=$((try+1)); continue
+        fi
+        insecure_flag=()
+        [[ "$cmd" == *"--allow-insecure"* || "$url" == http://* ]] && insecure_flag=(--allow-insecure)
+        if (cd /etc/pterodactyl && /usr/local/bin/wings configure --panel-url "$url" --token "$token" --node "$node" ${insecure_flag[@]+"${insecure_flag[@]}"}); then
+            success=1; break
+        fi
+        warn "Konfigurasi gagal (token expired / Panel tidak terjangkau). Ambil kode baru di Panel."
+        try=$((try+1))
+    done
+    if (( ! success )); then
+        err "Wings belum terkonfigurasi. Jalankan menu 2 lagi untuk mencoba ulang."
+        return 1
+    fi
+
+    cat >/etc/systemd/system/wings.service <<'EOF'
+[Unit]
+Description=Pterodactyl Wings Daemon
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+User=root
+WorkingDirectory=/etc/pterodactyl
+LimitNOFILE=4096
+PIDFile=/var/run/wings/daemon.pid
+ExecStart=/usr/local/bin/wings
+Restart=on-failure
+StartLimitInterval=180
+StartLimitBurst=30
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    run_or_die "Jalankan Wings" systemctl enable --now wings
+
+    local api_port sftp_port cfg=/etc/pterodactyl/config.yml
+    api_port="$(awk '/^api:/{f=1;next} f&&/^[^ ]/{f=0} f&&/^ +port:/{print $2;exit}' "$cfg" 2>/dev/null)"
+    sftp_port="$(awk '/^ +sftp:/{f=1;next} f&&/bind_port:/{print $2;exit}' "$cfg" 2>/dev/null)"
+    api_port="${api_port:-8080}"; sftp_port="${sftp_port:-2022}"
+    fw_open FW_PORTS_WINGS "${api_port}/tcp" "${sftp_port}/tcp"
 
     sleep 3
     echo ""
     echo -e "${GREEN}=============================================${NC}"
-    echo -e "${GREEN} Wings berhasil diinstal & dijalankan!${NC}"
+    echo -e "${GREEN} Wings terpasang & berjalan!${NC}"
     echo -e "${GREEN}=============================================${NC}"
-    systemctl status wings --no-pager -l | head -n 10
+    systemctl --no-pager -l status wings 2>/dev/null | head -n 8
     echo ""
-    echo -e "${YELLOW}Cek Panel: Admin > Nodes > node kamu harus berubah status jadi online/hijau.${NC}"
-    echo -e "${YELLOW}Kalau belum, cek log: journalctl -u wings -f${NC}"
-    echo ""
-    echo -e "${YELLOW}Buka firewall untuk port Daemon (biasanya 8443), 2022 (SFTP), dan port allocation game:${NC}"
-    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-        echo "  ufw allow 8443/tcp && ufw allow 2022/tcp"
-    else
-        echo "  firewall-cmd --permanent --add-port=8443/tcp --add-port=2022/tcp && firewall-cmd --reload"
-    fi
+    echo -e "${YELLOW}Cek Panel: Admin > Nodes, status node harus hijau. Log: journalctl -u wings -f${NC}"
+    echo -e "${YELLOW}Buka juga port allocation game di firewall/panel provider VPS.${NC}"
 }
 
 ###############################################################################
-# 3) UNINSTALL PANEL (bersih, tidak menyentuh paket dasar VPS)
+# UNINSTALL - helper
 ###############################################################################
-uninstall_panel() {
-    echo -e "${RED}=== Uninstall Pterodactyl Panel ===${NC}"
-    echo ""
-    echo "Yang akan dihapus (wajib):"
-    echo "  - File Panel (/var/www/pterodactyl)"
-    echo "  - Database & user Panel"
-    echo "  - Konfigurasi Nginx untuk Panel"
-    echo "  - Cron job & systemd service (pteroq)"
-    echo "  - (opsional) sertifikat SSL domain Panel"
-    echo "  - (opsional) paket pendukung: PHP, MariaDB, Nginx, Redis, Composer, Docker"
-    echo "  - (opsional) Wings beserta SEMUA container/server game di dalamnya"
-    echo ""
-    echo -e "${YELLOW}Semua bagian opsional di atas akan ditanya terpisah, default-nya TIDAK dihapus.${NC}"
-    echo ""
+HAVE_STATE=0
+NOSTATE_REMOVE_PKGS=0
 
-    read -p "Ketik 'HAPUS' untuk lanjut uninstall Panel: " CONFIRM
-    if [[ "$CONFIRM" != "HAPUS" ]]; then
-        echo -e "${YELLOW}Dibatalkan.${NC}"
-        return
-    fi
+want_remove() {   # want_remove INST_KEY -> true bila script ini yang memasang (atau user minta hapus semua)
+    if (( HAVE_STATE )); then [[ "${!1:-0}" == "1" ]]
+    else [[ "$NOSTATE_REMOVE_PKGS" == "1" ]]; fi
+}
 
-    # Baca info dari instalasi sebelumnya (dicatat otomatis oleh menu 1),
-    # supaya kamu tidak perlu mengingat-ingat nama database/user/domain.
-    SAVED_FQDN=""
-    SAVED_DBNAME=""
-    SAVED_DBUSER=""
-    if [[ -f /root/.installerptd-info ]]; then
-        # shellcheck disable=SC1091
-        source /root/.installerptd-info
-        SAVED_FQDN="$PANEL_FQDN"
-        SAVED_DBNAME="$PANEL_DB_NAME"
-        SAVED_DBUSER="$PANEL_DB_USER"
+env_val() { [[ -f "$PANEL_DIR/.env" ]] && grep -E "^$1=" "$PANEL_DIR/.env" | head -1 | cut -d= -f2- | tr -d "\"'"; }
 
-        echo ""
-        echo -e "${CYAN}Info instalasi sebelumnya terdeteksi:${NC}"
-        echo "  Domain  : ${SAVED_FQDN:-(tidak tercatat)}"
-        echo "  Nama DB : ${SAVED_DBNAME:-(tidak tercatat)}"
-        echo "  User DB : ${SAVED_DBUSER:-(tidak tercatat)}"
-        echo -e "${YELLOW}Tekan Enter untuk pakai nilai di atas, atau ketik nilai lain untuk override.${NC}"
-        echo ""
-    else
-        echo -e "${YELLOW}Tidak ditemukan catatan instalasi sebelumnya (mungkin Panel diinstal manual/cara lain).${NC}"
-        echo ""
-    fi
+nginx_has_other_sites() {
+    local f
+    for f in /etc/nginx/sites-enabled/* /etc/nginx/conf.d/*.conf; do
+        [[ -e "$f" ]] || continue
+        case "$(basename "$f")" in default|default.conf|pterodactyl.conf) continue ;; esac
+        return 0
+    done
+    return 1
+}
 
-    read -p "Nama database Panel yang mau dihapus (default: ${SAVED_DBNAME:-panel}): " DBNAME
-    DBNAME=${DBNAME:-${SAVED_DBNAME:-panel}}
-    read -p "Nama user database Panel yang mau dihapus (default: ${SAVED_DBUSER:-pterodactyl}): " DBUSER
-    DBUSER=${DBUSER:-${SAVED_DBUSER:-pterodactyl}}
-    read -p "Domain Panel (default: ${SAVED_FQDN:-kosongkan jika tidak perlu}): " FQDN
-    FQDN=${FQDN:-$SAVED_FQDN}
+other_certs_exist() {
+    [[ -d /etc/letsencrypt/live ]] || return 1
+    [[ -n "$(find /etc/letsencrypt/live -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)" ]]
+}
 
-    echo -e "${GREEN}[1/5] Menghentikan service Panel...${NC}"
-    systemctl stop pteroq 2>/dev/null || true
-    systemctl disable pteroq 2>/dev/null || true
-    rm -f /etc/systemd/system/pteroq.service
-    systemctl daemon-reload
+stop_units() {   # stop_units unit...   (abaikan unit yang tidak ada)
+    local u
+    for u in "$@"; do
+        systemctl disable --now "$u" >>"$LOG_FILE" 2>&1 || true
+    done
+}
 
-    echo -e "${GREEN}[2/5] Menghapus cron job Panel...${NC}"
+###############################################################################
+# UNINSTALL - langkah-langkah
+###############################################################################
+un_services_and_cron() {
+    stop_units pteroq.service
+    rm -f /etc/systemd/system/pteroq.service /etc/cron.d/pterodactyl /etc/cron.d/installerptd-certbot
     ( crontab -l 2>/dev/null | grep -v 'pterodactyl/artisan schedule:run' ) | crontab - 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl reset-failed >>"$LOG_FILE" 2>&1 || true
+}
 
-    echo -e "${GREEN}[3/5] Menghapus file Panel...${NC}"
-    rm -rf /var/www/pterodactyl
+un_nginx_site() {
+    rm -f /etc/nginx/sites-enabled/pterodactyl.conf /etc/nginx/sites-available/pterodactyl.conf \
+          /etc/nginx/conf.d/pterodactyl.conf /var/log/nginx/pterodactyl.app-*.log*
+    rm -rf "$ACME_ROOT"
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        nginx -t >>"$LOG_FILE" 2>&1 && systemctl reload nginx >>"$LOG_FILE" 2>&1 || true
+    fi
+}
 
-    echo -e "${GREEN}[4/5] Menghapus database & user Panel...${NC}"
-    DB_DROP_OK=0
-    if command -v mysql &> /dev/null && systemctl is-active --quiet mariadb 2>/dev/null; then
-        if mysql -u root <<MYSQL_SCRIPT 2>/dev/null
-DROP DATABASE IF EXISTS ${DBNAME};
+un_database() {
+    command -v "$(basename "$(mysql_bin 2>/dev/null || echo mysql)")" >/dev/null 2>&1 || { warn "Client MariaDB tidak ada, lewati drop database."; return 0; }
+    systemctl is-active --quiet "${DB_SERVICE:-mariadb}" 2>/dev/null || systemctl start "${DB_SERVICE:-mariadb}" >>"$LOG_FILE" 2>&1 || true
+    if ! ensure_mysql_access; then
+        warn "Tidak bisa login MariaDB. Hapus manual nanti: DROP DATABASE \`${DBNAME}\`; DROP USER '${DBUSER}'@'127.0.0.1';"
+        return 0
+    fi
+    mysql_root <<SQL
+DROP DATABASE IF EXISTS \`${DBNAME}\`;
 DROP USER IF EXISTS '${DBUSER}'@'127.0.0.1';
 FLUSH PRIVILEGES;
-MYSQL_SCRIPT
-        then
-            DB_DROP_OK=1
-        fi
+SQL
+}
+
+un_ssl() {
+    [[ -n "${FQDN:-}" ]] || return 0
+    if command -v certbot >/dev/null 2>&1; then
+        certbot delete --cert-name "$FQDN" --non-interactive >>"$LOG_FILE" 2>&1 || true
     fi
-    if [[ $DB_DROP_OK -eq 1 ]]; then
-        echo "Database & user berhasil dihapus."
-    else
-        echo -e "${YELLOW}Lewati drop database (MariaDB tidak aktif atau tidak terinstal). Tidak masalah jika kamu akan hapus paket database sepenuhnya di langkah berikutnya.${NC}"
+    rm -rf "/etc/letsencrypt/live/${FQDN}" "/etc/letsencrypt/archive/${FQDN}" "/etc/letsencrypt/renewal/${FQDN}.conf"
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/reload-services.sh
+}
+
+un_panel_files() {
+    rm -rf "$PANEL_DIR"
+    rmdir /var/www 2>/dev/null || true
+    if command -v semanage >/dev/null 2>&1 && [[ "${SELINUX_FCONTEXT:-0}" == "1" ]]; then
+        semanage fcontext -d "${PANEL_DIR}(/.*)?" >>"$LOG_FILE" 2>&1 || true
     fi
+    rm -f /etc/php-fpm.d/pterodactyl.conf /etc/my.cnf.d/zz-pterodactyl-bind.cnf
+}
 
-    echo -e "${GREEN}[5/5] Menghapus konfigurasi Nginx untuk Panel...${NC}"
-    rm -f /etc/nginx/sites-enabled/pterodactyl.conf
-    rm -f /etc/nginx/sites-available/pterodactyl.conf
-    rm -f /etc/nginx/conf.d/pterodactyl.conf
-    systemctl reload nginx 2>/dev/null || true
+un_composer() {
+    rm -f /usr/local/bin/composer
+    rm -rf /root/.composer /root/.config/composer /root/.cache/composer
+}
 
-    if [[ -n "$FQDN" ]]; then
-        read -p "Hapus juga sertifikat SSL untuk ${FQDN}? (y/n): " RM_SSL
-        if [[ "$RM_SSL" == "y" ]]; then
-            if command -v certbot &> /dev/null; then
-                certbot delete --cert-name "$FQDN" --non-interactive 2>/dev/null || true
-            fi
-            rm -rf "/etc/letsencrypt/live/${FQDN}"
-            rm -rf "/etc/letsencrypt/archive/${FQDN}"
-            rm -f "/etc/letsencrypt/renewal/${FQDN}.conf"
-        fi
-    fi
-
-    echo ""
-    echo -e "${GREEN}Bagian Panel (file, database, Nginx config) sudah bersih.${NC}"
-    echo ""
-
-    WINGS_REMOVED=0
-    echo -e "${YELLOW}Mau hapus juga Wings beserta SEMUA container/server game di dalamnya?${NC}"
-    echo -e "${RED}Data world, plugin, dan save game di tiap server AKAN HILANG PERMANEN.${NC}"
-    read -p "Hapus Wings + semua container game? (y/n): " RM_WINGS
-
-    if [[ "$RM_WINGS" == "y" ]]; then
-        read -p "Konfirmasi sekali lagi, ketik 'HAPUS' untuk benar-benar menghapus Wings: " CONFIRM_WINGS
-        if [[ "$CONFIRM_WINGS" == "HAPUS" ]]; then
-            remove_wings
-            WINGS_REMOVED=1
+un_php() {
+    local s v list
+    for s in $(systemctl list-unit-files --no-legend 'php*fpm*.service' 2>/dev/null | awk '{print $1}'); do
+        stop_units "$s"
+    done
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        v="${PANEL_PHP_VER:-}"
+        if [[ -n "$v" ]]; then list="$(pkgs_matching "^php${v//./\\.}(-.*)?\$")"
+        else list="$(pkgs_matching '^php[0-9]+\.[0-9]+(-.*)?$')"; fi
+        # shellcheck disable=SC2086
+        pkgs_purge $list
+        # jika tidak ada versi PHP lain tersisa, buang juga paket generik (php-common, dll)
+        if [[ -z "$(pkgs_matching '^php[0-9]+\.[0-9]+-cli$')" ]]; then
+            list="$(pkgs_matching '^php(-.*)?$')"
+            # shellcheck disable=SC2086
+            pkgs_purge $list
+            rm -rf /etc/php /var/lib/php /var/log/php* /run/php
         else
-            echo -e "${YELLOW}Dibatalkan, Wings tidak jadi dihapus.${NC}"
+            [[ -n "$v" ]] && rm -rf "/etc/php/${v}" "/var/log/php${v}-fpm.log"
         fi
     else
-        echo -e "${YELLOW}Wings tetap dipertahankan.${NC}"
+        list="$(pkgs_matching '^php(-.*)?$')"
+        # shellcheck disable=SC2086
+        pkgs_purge $list
+        dnf -y module reset php >>"$LOG_FILE" 2>&1 || true
+        rm -rf /etc/php-fpm.d /etc/php.d /etc/php.ini /etc/php-zts.d /var/lib/php /var/log/php-fpm /run/php-fpm
     fi
+}
+
+un_nginx_pkg() {
+    stop_units nginx.service
+    local list; list="$(pkgs_matching '^(nginx(-.*)?|libnginx-mod-.*)$')"
+    # shellcheck disable=SC2086
+    pkgs_purge $list
+    rm -rf /etc/nginx /var/log/nginx /var/lib/nginx /usr/share/nginx
+}
+
+un_mariadb_pkg() {
+    stop_units mariadb.service mysql.service mysqld.service
+    pkill -9 -x mariadbd 2>/dev/null || true
+    pkill -9 -x mysqld 2>/dev/null || true
+    sleep 2
+    local list; list="$(pkgs_matching '^(mariadb(-.*)?|galera(-[0-9]+)?|mysql-common)$')"
+    # shellcheck disable=SC2086
+    pkgs_purge $list
+    rm -rf /var/lib/mysql /etc/mysql /var/log/mysql /var/log/mariadb /etc/my.cnf.d /run/mysqld /run/mariadb
+    [[ -f /etc/my.cnf && "$DISTRO_FAMILY" == "rhel" ]] && rm -f /etc/my.cnf
+}
+
+un_redis_pkg() {
+    stop_units redis-server.service redis.service valkey-server.service valkey.service
+    local list; list="$(pkgs_matching '^(redis(-.*)?|valkey(-.*)?)$')"
+    # shellcheck disable=SC2086
+    pkgs_purge $list
+    rm -rf /var/lib/redis /etc/redis /var/log/redis /var/lib/valkey /etc/valkey /var/log/valkey
+}
+
+un_certbot_pkg() {
+    stop_units certbot.timer certbot-renew.timer
+    local list; list="$(pkgs_matching '^(certbot|python3-certbot.*)$')"
+    # shellcheck disable=SC2086
+    pkgs_purge $list
+    rm -rf /etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt
+}
+
+un_third_party_repos() {
+    if [[ "$DISTRO_FAMILY" == "debian" ]]; then
+        if [[ -n "${REPO_PHP:-}" ]] && want_remove INST_PHP; then
+            remove_php_repo_debian
+            ok "Repo PHP tambahan (${REPO_PHP}) dihapus."
+        fi
+    else
+        if [[ "${REPO_REMI:-0}" == "1" ]] && want_remove INST_PHP; then
+            dnf -y remove remi-release >>"$LOG_FILE" 2>&1 || true
+            rm -f /etc/yum.repos.d/remi*.repo
+            ok "Repo Remi dihapus."
+        fi
+        if [[ "${REPO_EPEL:-0}" == "1" ]] && (( HAVE_STATE )); then
+            dnf -y remove epel-release >>"$LOG_FILE" 2>&1 || true
+        fi
+    fi
+    [[ "$DISTRO_FAMILY" == "debian" ]] && { apt_get update >>"$LOG_FILE" 2>&1 || true; }
+}
+
+###############################################################################
+# 3) UNINSTALL PANEL
+###############################################################################
+uninstall_panel() {
+    step "Uninstall Pterodactyl Panel (bersih total)"
+    state_load
+    [[ -f "$STATE_FILE" ]] && HAVE_STATE=1
+
+    FQDN="${PANEL_FQDN:-}"; DBNAME="${PANEL_DB_NAME:-}"; DBUSER="${PANEL_DB_USER:-}"
+    if [[ -z "$PANEL_DIR" ]]; then die "PANEL_DIR kosong."; fi
+    if (( ! HAVE_STATE )); then
+        warn "Catatan instalasi tidak ditemukan (Panel dipasang manual / script versi lama)."
+        local u; u="$(env_val APP_URL)"; u="${u#*://}"; u="${u%%/*}"
+        FQDN="${u:-}"; DBNAME="$(env_val DB_DATABASE)"; DBUSER="$(env_val DB_USERNAME)"
+        ask FQDN "Domain Panel" "${FQDN:-panel.contoh.com}" is_host
+        ask DBNAME "Nama database Panel" "${DBNAME:-panel}" is_ident
+        ask DBUSER "User database Panel" "${DBUSER:-pterodactyl}" is_ident
+        if confirm "Hapus juga paket pendukung (PHP, Nginx, MariaDB, Redis, Certbot, Composer)? Pilih y hanya jika VPS ini khusus Panel" n; then
+            NOSTATE_REMOVE_PKGS=1
+        fi
+    fi
+
+    local has_wings=0 has_docker=0 rm_wings=0 rm_docker=0
+    [[ -x /usr/local/bin/wings || -d /etc/pterodactyl ]] && has_wings=1
+    command -v docker >/dev/null 2>&1 && has_docker=1
 
     echo ""
-    echo -e "${YELLOW}Mau hapus juga paket pendukung (PHP, MariaDB, Nginx, Redis, Composer)?${NC}"
-    echo -e "${YELLOW}Pilih 'y' hanya kalau VPS ini TIDAK dipakai untuk hal lain selain Panel.${NC}"
-    read -p "Hapus paket pendukung juga? (y/n): " RM_PKG
-
-    if [[ "$RM_PKG" == "y" ]]; then
-        if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-            remove_support_packages_debian "$WINGS_REMOVED"
-        else
-            remove_support_packages_rhel "$WINGS_REMOVED"
-        fi
+    echo "Yang akan DIHAPUS:"
+    echo "  - File Panel (${PANEL_DIR}), service pteroq, cron, config Nginx, log Panel"
+    echo "  - Database '${DBNAME}' & user '${DBUSER}'"
+    echo "  - Sertifikat SSL '${FQDN:-(tidak ada)}', rule firewall & konteks SELinux yang dibuat script"
+    local k name; local pk=()
+    for k in "INST_PHP:PHP" "INST_NGINX:Nginx" "INST_MARIADB:MariaDB" "INST_REDIS:Redis/Valkey" "INST_CERTBOT:Certbot" "INST_COMPOSER:Composer"; do
+        name="${k#*:}"; want_remove "${k%%:*}" && pk+=("$name")
+    done
+    if (( ${#pk[@]} )); then
+        echo "  - Paket yang dulu dipasang script ini: ${pk[*]}"
+        echo "    (paket yang sudah ada sebelum script dijalankan TIDAK disentuh)"
     else
-        echo -e "${YELLOW}Paket pendukung (PHP, MariaDB, Nginx, Redis) tetap dipertahankan.${NC}"
+        echo "  - Paket pendukung: tidak dihapus (sudah ada sebelum script / tidak dipilih)"
+    fi
+    echo ""
+
+    if (( has_wings )); then
+        warn "Wings terdeteksi di VPS ini."
+        if confirm "Hapus juga Wings + SEMUA server game (data world/plugin hilang permanen)?" n; then
+            read -r -p "Ketik 'HAPUS WINGS' untuk konfirmasi: " c
+            [[ "$(trim "$c")" == "HAPUS WINGS" ]] && rm_wings=1 || warn "Wings dipertahankan."
+        fi
+    fi
+    if (( has_docker )) && [[ "${INST_DOCKER:-}" == "1" || $HAVE_STATE -eq 0 ]]; then
+        if confirm "Hapus juga Docker (beserta semua image/container)?" n; then rm_docker=1; fi
     fi
 
-    rm -f /root/.installerptd-info
+    read -r -p "Ketik 'HAPUS' untuk memulai uninstall: " c
+    [[ "$(trim "$c")" == "HAPUS" ]] || { warn "Dibatalkan."; return 0; }
 
+    detect_services_for_uninstall
+
+    echo ""
+    run_soft "Hentikan service, hapus cron & unit systemd" un_services_and_cron
+    run_soft "Hapus konfigurasi & log Nginx Panel" un_nginx_site
+    run_soft "Hapus database & user Panel" un_database
+    run_soft "Hapus sertifikat SSL" un_ssl
+    run_soft "Hapus file Panel & config pendukung" un_panel_files
+    fw_close_recorded FW_PORTS_PANEL
+
+    if (( rm_wings )); then run_soft "Hapus Wings & container game" remove_wings; fi
+
+    # ---- paket pendukung ----
+    if want_remove INST_NGINX; then
+        if nginx_has_other_sites; then warn "Ada site Nginx lain -> Nginx dipertahankan."
+        else run_soft "Hapus Nginx" un_nginx_pkg; fi
+    fi
+    if want_remove INST_MARIADB; then
+        local others=""
+        if systemctl is-active --quiet "${DB_SERVICE:-mariadb}" 2>/dev/null && ensure_mysql_access; then
+            others="$(mysql_root -N -e 'SHOW DATABASES' 2>/dev/null | grep -Ev '^(information_schema|mysql|performance_schema|sys|test)$' || true)"
+        fi
+        if [[ -n "$others" ]]; then
+            warn "MariaDB masih berisi database lain:"; echo "$others" | sed 's/^/     - /'
+            if confirm "Tetap hapus MariaDB beserta SEMUA database di atas?" n; then run_soft "Hapus MariaDB" un_mariadb_pkg
+            else info "MariaDB dipertahankan."; fi
+        else
+            run_soft "Hapus MariaDB" un_mariadb_pkg
+        fi
+    fi
+    want_remove INST_REDIS && run_soft "Hapus Redis/Valkey" un_redis_pkg
+    if want_remove INST_PHP; then run_soft "Hapus PHP" un_php
+    else systemctl list-unit-files --no-legend 'php*fpm*.service' >/dev/null 2>&1 && systemctl reload "php-fpm" >>"$LOG_FILE" 2>&1 || true; fi
+    if want_remove INST_CERTBOT; then
+        if other_certs_exist; then warn "Masih ada sertifikat lain -> Certbot dipertahankan."
+        else run_soft "Hapus Certbot" un_certbot_pkg; fi
+    fi
+    want_remove INST_COMPOSER && run_soft "Hapus Composer & cache" un_composer
+    un_third_party_repos
+
+    if (( rm_docker )); then run_soft "Hapus Docker" remove_docker; fi
+
+    if confirm "Jalankan autoremove untuk membersihkan dependency yatim?" y; then
+        if [[ "$DISTRO_FAMILY" == "debian" ]]; then run_soft "apt autoremove" apt_get autoremove --purge
+        else run_soft "dnf autoremove" dnf -y autoremove; fi
+    fi
+
+    rm -f "$STATE_FILE"
+    verify_clean
     echo ""
     echo -e "${GREEN}=============================================${NC}"
     echo -e "${GREEN} Uninstall Panel selesai.${NC}"
-    if [[ $WINGS_REMOVED -eq 1 ]]; then
-        echo -e "${GREEN} Wings beserta container game juga sudah dihapus.${NC}"
-    else
-        echo -e "${GREEN} Wings tetap utuh (tidak dihapus).${NC}"
-    fi
+    (( rm_wings )) && echo -e "${GREEN} Wings & container game ikut dihapus.${NC}"
+    (( has_wings && ! rm_wings )) && echo -e "${YELLOW} Wings dipertahankan (hapus lewat menu 4).${NC}"
     echo -e "${GREEN}=============================================${NC}"
+    rm -f "$LOG_FILE"
+}
+
+detect_services_for_uninstall() {
+    DB_SERVICE="$(first_service mariadb mysql mysqld || true)"
+    REDIS_SERVICE="$(first_service redis-server redis valkey-server valkey || true)"
+}
+
+verify_clean() {
+    local left=() p
+    for p in "$PANEL_DIR" /etc/systemd/system/pteroq.service /etc/cron.d/pterodactyl \
+             /etc/nginx/sites-available/pterodactyl.conf /etc/nginx/sites-enabled/pterodactyl.conf \
+             /etc/nginx/conf.d/pterodactyl.conf /etc/php-fpm.d/pterodactyl.conf "$ACME_ROOT"; do
+        [[ -e "$p" ]] && left+=("$p")
+    done
+    if (( ${#left[@]} )); then
+        warn "Masih ada sisa, hapus manual:"; printf '     %s\n' "${left[@]}"
+    else
+        ok "Verifikasi: tidak ada sisa file/konfigurasi Panel."
+    fi
 }
 
 ###############################################################################
-# Hapus Wings + semua container game (dipanggil hanya jika user konfirmasi)
+# 4) UNINSTALL WINGS
 ###############################################################################
-remove_wings() {
-    echo -e "${GREEN}Menghapus Wings & container game...${NC}"
+wings_cfg_dirs() {
+    local cfg=/etc/pterodactyl/config.yml
+    [[ -f "$cfg" ]] || return 0
+    grep -E '^[[:space:]]+(root_directory|log_directory|data|archive_directory|backup_directory|tmp_directory):' "$cfg" \
+        | awk '{print $2}' | tr -d "\"'"
+}
 
-    systemctl stop wings 2>/dev/null || true
-    systemctl disable wings 2>/dev/null || true
+remove_wings() {
+    local d
+    stop_units wings.service
     rm -f /etc/systemd/system/wings.service
     systemctl daemon-reload
-
-    if command -v docker &> /dev/null; then
-        CONTAINERS=$(docker ps -aq --filter "label=Service=Pterodactyl" 2>/dev/null || true)
-        if [[ -n "$CONTAINERS" ]]; then
-            docker rm -f $CONTAINERS 2>/dev/null || true
-        fi
+    if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker 2>/dev/null; then
+        local ids; ids="$(docker ps -aq --filter 'label=Service=Pterodactyl' 2>/dev/null || true)"
+        # shellcheck disable=SC2086
+        [[ -n "$ids" ]] && docker rm -f $ids >>"$LOG_FILE" 2>&1
+        docker network rm pterodactyl_nw >>"$LOG_FILE" 2>&1 || true
     fi
-
-    rm -rf /etc/pterodactyl
+    for d in $(wings_cfg_dirs); do
+        [[ "$d" == /* && "$d" != "/" && "$d" == *pterodactyl* ]] && rm -rf "$d"
+    done
     rm -f /usr/local/bin/wings
-    rm -rf /var/lib/pterodactyl
-    rm -rf /var/log/pterodactyl
-
-    echo -e "${GREEN}Wings & container game berhasil dihapus.${NC}"
+    rm -rf /etc/pterodactyl /var/lib/pterodactyl /var/log/pterodactyl /tmp/pterodactyl /var/run/wings /run/wings
+    if id pterodactyl >/dev/null 2>&1; then userdel pterodactyl >>"$LOG_FILE" 2>&1 || true; fi
+    getent group pterodactyl >/dev/null 2>&1 && groupdel pterodactyl >>"$LOG_FILE" 2>&1 || true
+    fw_close_recorded FW_PORTS_WINGS
 }
 
-###############################################################################
-# Hapus paket pendukung dengan aman (anti-error saat purge MariaDB)
-###############################################################################
-remove_support_packages_debian() {
-    local WINGS_ALREADY_REMOVED="${1:-0}"
-    echo -e "${GREEN}Menghapus paket pendukung (Debian family)...${NC}"
-
-    # Matikan service dulu, jangan langsung purge selagi service jalan -
-    # ini penyebab paling umum error dpkg/mysqld saat purge mariadb-server
-    systemctl stop nginx "$PHP_FPM_SERVICE" "$REDIS_SERVICE" mariadb 2>/dev/null || true
-    systemctl disable nginx "$PHP_FPM_SERVICE" "$REDIS_SERVICE" mariadb 2>/dev/null || true
-
-    # Pastikan proses mysqld benar-benar mati sebelum purge,
-    # supaya dpkg tidak macet nunggu/gagal shutdown
-    pkill -9 -f mysqld 2>/dev/null || true
-    pkill -9 -f mariadbd 2>/dev/null || true
-    sleep 2
-
-    export DEBIAN_FRONTEND=noninteractive
-
-    # Purge satu per satu dengan '|| true' supaya satu paket gagal
-    # tidak menghentikan seluruh proses (dan tidak bikin dpkg nyangkut)
-    apt-get remove --purge -y mariadb-server mariadb-client mariadb-common mariadb-server-core-* mariadb-client-core-* 2>/dev/null || true
-    apt-get remove --purge -y nginx nginx-common nginx-core 2>/dev/null || true
-    apt-get remove --purge -y redis-server redis-tools 2>/dev/null || true
-    apt-get remove --purge -y 'php8.3*' 2>/dev/null || true
-
-    # Perbaiki state dpkg kalau ada paket yang setengah ke-purge
-    dpkg --configure -a 2>/dev/null || true
-    apt-get -f install -y 2>/dev/null || true
-
-    apt-get autoremove -y 2>/dev/null || true
-    apt-get autoclean -y 2>/dev/null || true
-
-    rm -f /usr/local/bin/composer
-    rm -rf /etc/nginx
-    rm -rf /etc/mysql /var/lib/mysql /var/log/mysql
-
-    echo -e "${GREEN}Paket pendukung (Debian family) berhasil dihapus.${NC}"
-    offer_remove_docker "$WINGS_ALREADY_REMOVED"
+remove_docker() {
+    stop_units docker.service docker.socket containerd.service
+    local list; list="$(pkgs_matching '^(docker-ce.*|docker\.io|docker-compose.*|docker-buildx-plugin|docker-model-plugin|containerd(\.io)?)$')"
+    # shellcheck disable=SC2086
+    pkgs_purge $list
+    rm -rf /var/lib/docker /var/lib/containerd /etc/docker /run/docker /run/docker.sock
+    rm -f /etc/apt/sources.list.d/docker.list /etc/apt/sources.list.d/docker.sources \
+          /etc/apt/keyrings/docker.asc /etc/apt/keyrings/docker.gpg /etc/yum.repos.d/docker-ce.repo
+    getent group docker >/dev/null 2>&1 && groupdel docker >>"$LOG_FILE" 2>&1 || true
 }
 
-remove_support_packages_rhel() {
-    local WINGS_ALREADY_REMOVED="${1:-0}"
-    echo -e "${GREEN}Menghapus paket pendukung (RHEL family)...${NC}"
-
-    systemctl stop nginx "$PHP_FPM_SERVICE" "$REDIS_SERVICE" mariadb 2>/dev/null || true
-    systemctl disable nginx "$PHP_FPM_SERVICE" "$REDIS_SERVICE" mariadb 2>/dev/null || true
-
-    pkill -9 -f mysqld 2>/dev/null || true
-    pkill -9 -f mariadbd 2>/dev/null || true
-    sleep 2
-
-    dnf remove -y mariadb-server mariadb 2>/dev/null || true
-    dnf remove -y nginx 2>/dev/null || true
-    dnf remove -y redis 2>/dev/null || true
-    dnf remove -y php php-cli php-gd php-mysqlnd php-mbstring php-bcmath php-xml \
-        php-fpm php-curl php-zip php-intl php-pdo 2>/dev/null || true
-
-    dnf module reset php -y 2>/dev/null || true
-    dnf autoremove -y 2>/dev/null || true
-
-    rm -f /usr/local/bin/composer
-    rm -rf /etc/nginx
-    rm -rf /var/lib/mysql /var/log/mariadb /etc/my.cnf.d /etc/my.cnf
-
-    echo -e "${GREEN}Paket pendukung (RHEL family) berhasil dihapus.${NC}"
-    offer_remove_docker "$WINGS_ALREADY_REMOVED"
-}
-
-offer_remove_docker() {
-    local WINGS_ALREADY_REMOVED="${1:-0}"
-    if command -v docker &> /dev/null; then
-        echo ""
-        if [[ "$WINGS_ALREADY_REMOVED" == "1" ]]; then
-            echo -e "${YELLOW}Docker terdeteksi terinstal. Wings sudah kamu hapus duluan.${NC}"
-        else
-            echo -e "${YELLOW}Docker terdeteksi terinstal. Wings masih ada dan butuh Docker untuk jalan.${NC}"
-        fi
-        read -p "Hapus Docker juga? (y/n): " RM_DOCKER
-        if [[ "$RM_DOCKER" == "y" ]]; then
-            systemctl stop docker 2>/dev/null || true
-            if [[ "$DISTRO_FAMILY" == "debian" ]]; then
-                apt-get remove --purge -y docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || true
-                apt-get autoremove -y 2>/dev/null || true
-            else
-                dnf remove -y docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || true
-            fi
-            rm -rf /var/lib/docker /etc/docker
-            echo -e "${GREEN}Docker dihapus.${NC}"
-        fi
+uninstall_wings() {
+    step "Uninstall Wings"
+    state_load
+    if [[ ! -x /usr/local/bin/wings && ! -d /etc/pterodactyl ]]; then
+        warn "Wings tidak ditemukan di VPS ini."; return 0
     fi
+    warn "Semua server game (container + data world/plugin) AKAN HILANG PERMANEN."
+    local c rm_docker=0
+    read -r -p "Ketik 'HAPUS WINGS' untuk lanjut: " c
+    [[ "$(trim "$c")" == "HAPUS WINGS" ]] || { warn "Dibatalkan."; return 0; }
+    if command -v docker >/dev/null 2>&1 && confirm "Hapus juga Docker (termasuk image/container lain)?" n; then rm_docker=1; fi
+
+    run_soft "Hapus Wings, container & data" remove_wings
+    (( rm_docker )) && run_soft "Hapus Docker" remove_docker
+    state_set WINGS_INSTALLED 0
+    ok "Wings berhasil dihapus."
 }
 
 ###############################################################################
 # MENU UTAMA
 ###############################################################################
-detect_os
+main() {
+    if [[ $EUID -ne 0 ]]; then
+        echo -e "${RED}Jalankan script ini sebagai root (sudo bash installerptd.sh).${NC}"; exit 1
+    fi
+    mkdir -p "$(dirname "$LOG_FILE")"; : >>"$LOG_FILE"; chmod 600 "$LOG_FILE"
+    trap 'echo; warn "Dibatalkan oleh user."; exit 130' INT
 
-clear
-echo -e "${CYAN}=============================================${NC}"
-echo -e "${CYAN}       installerptd.sh - Pterodactyl Tool${NC}"
-echo -e "${CYAN}       OS terdeteksi: ${OS_PRETTY}${NC}"
-echo -e "${CYAN}=============================================${NC}"
-echo "1) Install Panel"
-echo "2) Install & Aktifkan Wings"
-echo "3) Uninstall Panel"
-echo "0) Keluar"
-echo ""
-read -p "Pilih opsi [0-3]: " OPSI
+    # Jika dijalankan lewat pipe (curl | bash), ambil input dari terminal
+    if [[ ! -t 0 ]]; then
+        if [[ -r /dev/tty ]]; then exec </dev/tty; else die "Butuh terminal interaktif."; fi
+    fi
 
-case $OPSI in
-    1) install_panel ;;
-    2) install_wings ;;
-    3) uninstall_panel ;;
-    0) echo "Keluar."; exit 0 ;;
-    *) echo -e "${RED}Pilihan tidak valid.${NC}"; exit 1 ;;
-esac
+    detect_os
+    local opsi="${1:-}"
+    if [[ -z "$opsi" ]]; then
+        clear 2>/dev/null || true
+        echo -e "${CYAN}=============================================${NC}"
+        echo -e "${CYAN}   installerptd.sh v${SCRIPT_VERSION} - Pterodactyl Tool${NC}"
+        echo -e "${CYAN}   OS: ${OS_PRETTY} (${DISTRO_FAMILY})${NC}"
+        echo -e "${CYAN}=============================================${NC}"
+        echo "1) Install Panel"
+        echo "2) Install & Aktifkan Wings"
+        echo "3) Uninstall Panel (bersih total)"
+        echo "4) Uninstall Wings"
+        echo "0) Keluar"
+        echo ""
+        read -r -p "Pilih opsi [0-4]: " opsi || exit 1
+        opsi="$(trim "$opsi")"
+    fi
+
+    case "$opsi" in
+        1) install_panel ;;
+        2) install_wings ;;
+        3) uninstall_panel ;;
+        4) uninstall_wings ;;
+        0) echo "Keluar."; exit 0 ;;
+        *) err "Pilihan tidak valid."; exit 1 ;;
+    esac
+}
+
+# Jalankan main hanya bila file dieksekusi langsung (bukan di-source untuk test)
+if [[ -z "${BASH_SOURCE[0]:-}" || "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
