@@ -42,6 +42,7 @@ detect_os() {
     OS_ID="${ID,,}"
     OS_ID_LIKE="${ID_LIKE,,}"
     OS_PRETTY="${PRETTY_NAME}"
+    OS_VERSION="${VERSION_ID}"
 
     case "$OS_ID" in
         ubuntu|debian|linuxmint|pop)
@@ -88,17 +89,44 @@ install_dependencies_debian() {
     apt update -y && apt upgrade -y
     apt install -y curl wget sudo gnupg2 software-properties-common apt-transport-https ca-certificates lsb-release unzip git
 
-    echo -e "${GREEN}Install PHP 8.3, MariaDB, Nginx, Redis, Composer...${NC}"
-    LC_ALL=C.UTF-8 add-apt-repository ppa:ondrej/php -y
-    apt update -y
-    apt install -y php8.3 php8.3-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl,sqlite3} \
-        mariadb-server nginx tar redis-server
+    echo -e "${GREEN}Install PHP, MariaDB, Nginx, Redis, Composer...${NC}"
+
+    # Tentukan apakah perlu pakai PHP native (bukan PPA Ondrej).
+    # PPA Ondrej biasanya baru menyediakan paket beberapa saat setelah
+    # rilis Ubuntu baru, jadi untuk Ubuntu >= 26.04 kita pakai PHP bawaan repo resmi.
+    USE_NATIVE_PHP=0
+    if [[ "$OS_ID" == "ubuntu" ]]; then
+        OLDEST=$(printf '%s\n%s\n' "$OS_VERSION" "26.04" | sort -V | head -n1)
+        if [[ "$OLDEST" != "26.04" || "$OS_VERSION" == "26.04" ]]; then
+            USE_NATIVE_PHP=1
+        fi
+    fi
+
+    if [[ "$USE_NATIVE_PHP" -eq 1 ]]; then
+        echo -e "${YELLOW}Terdeteksi Ubuntu ${OS_VERSION}. PPA Ondrej kemungkinan belum tersedia untuk versi ini,${NC}"
+        echo -e "${YELLOW}jadi PHP akan diinstall langsung dari repo resmi Ubuntu (native), bukan PPA.${NC}"
+
+        apt install -y php php-cli php-gd php-mysql php-mbstring php-bcmath php-xml \
+            php-fpm php-curl php-zip php-intl php-sqlite3
+
+        # Deteksi versi PHP yang benar-benar terpasang, supaya nama service & socket tepat
+        PHP_VER_DETECTED=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;' 2>/dev/null)
+        if [[ -n "$PHP_VER_DETECTED" ]]; then
+            PHP_FPM_SOCK="/run/php/php${PHP_VER_DETECTED}-fpm.sock"
+            PHP_FPM_SERVICE="php${PHP_VER_DETECTED}-fpm"
+            echo -e "${CYAN}PHP terdeteksi versi ${PHP_VER_DETECTED} -> service: ${PHP_FPM_SERVICE}, socket: ${PHP_FPM_SOCK}${NC}"
+        fi
+    else
+        LC_ALL=C.UTF-8 add-apt-repository ppa:ondrej/php -y
+        apt update -y
+        apt install -y php8.3 php8.3-{cli,gd,mysql,mbstring,bcmath,xml,fpm,curl,zip,intl,sqlite3}
+    fi
+
+    apt install -y mariadb-server nginx tar redis-server certbot
 
     if ! command -v composer &> /dev/null; then
         curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
     fi
-
-    apt install -y certbot
 
     systemctl enable --now mariadb "$REDIS_SERVICE" nginx "$PHP_FPM_SERVICE"
 }
@@ -334,6 +362,15 @@ EOF
     systemctl start nginx
     systemctl enable nginx
 
+    # Simpan info instalasi (domain, nama DB, user DB) supaya bisa ditampilkan
+    # lagi otomatis saat Uninstall Panel (menu 3), biar tidak perlu diingat manual.
+    cat > /root/.installerptd-info <<EOF
+PANEL_FQDN="${FQDN}"
+PANEL_DB_NAME="${DBNAME}"
+PANEL_DB_USER="${DBUSER}"
+EOF
+    chmod 600 /root/.installerptd-info
+
     echo ""
     echo -e "${GREEN}=============================================${NC}"
     echo -e "${GREEN} Panel berhasil diinstal!${NC}"
@@ -497,11 +534,36 @@ uninstall_panel() {
         return
     fi
 
-    read -p "Nama database Panel yang mau dihapus (default: panel): " DBNAME
-    DBNAME=${DBNAME:-panel}
-    read -p "Nama user database Panel yang mau dihapus (default: pterodactyl): " DBUSER
-    DBUSER=${DBUSER:-pterodactyl}
-    read -p "Domain Panel (untuk hapus sertifikat SSL, kosongkan jika tidak perlu): " FQDN
+    # Baca info dari instalasi sebelumnya (dicatat otomatis oleh menu 1),
+    # supaya kamu tidak perlu mengingat-ingat nama database/user/domain.
+    SAVED_FQDN=""
+    SAVED_DBNAME=""
+    SAVED_DBUSER=""
+    if [[ -f /root/.installerptd-info ]]; then
+        # shellcheck disable=SC1091
+        source /root/.installerptd-info
+        SAVED_FQDN="$PANEL_FQDN"
+        SAVED_DBNAME="$PANEL_DB_NAME"
+        SAVED_DBUSER="$PANEL_DB_USER"
+
+        echo ""
+        echo -e "${CYAN}Info instalasi sebelumnya terdeteksi:${NC}"
+        echo "  Domain  : ${SAVED_FQDN:-(tidak tercatat)}"
+        echo "  Nama DB : ${SAVED_DBNAME:-(tidak tercatat)}"
+        echo "  User DB : ${SAVED_DBUSER:-(tidak tercatat)}"
+        echo -e "${YELLOW}Tekan Enter untuk pakai nilai di atas, atau ketik nilai lain untuk override.${NC}"
+        echo ""
+    else
+        echo -e "${YELLOW}Tidak ditemukan catatan instalasi sebelumnya (mungkin Panel diinstal manual/cara lain).${NC}"
+        echo ""
+    fi
+
+    read -p "Nama database Panel yang mau dihapus (default: ${SAVED_DBNAME:-panel}): " DBNAME
+    DBNAME=${DBNAME:-${SAVED_DBNAME:-panel}}
+    read -p "Nama user database Panel yang mau dihapus (default: ${SAVED_DBUSER:-pterodactyl}): " DBUSER
+    DBUSER=${DBUSER:-${SAVED_DBUSER:-pterodactyl}}
+    read -p "Domain Panel (default: ${SAVED_FQDN:-kosongkan jika tidak perlu}): " FQDN
+    FQDN=${FQDN:-$SAVED_FQDN}
 
     echo -e "${GREEN}[1/5] Menghentikan service Panel...${NC}"
     systemctl stop pteroq 2>/dev/null || true
@@ -586,6 +648,8 @@ MYSQL_SCRIPT
     else
         echo -e "${YELLOW}Paket pendukung (PHP, MariaDB, Nginx, Redis) tetap dipertahankan.${NC}"
     fi
+
+    rm -f /root/.installerptd-info
 
     echo ""
     echo -e "${GREEN}=============================================${NC}"
